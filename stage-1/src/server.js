@@ -43,9 +43,46 @@ function freshState() {
 
 let state = freshState();
 
+const ID_PREFIX = { user: 'u', payment: 'p', request: 'rq', split: 'sp', settlement: 'st' };
+const ID_MAP_FOR = {
+  user: () => state.users,
+  payment: () => state.payments,
+  request: () => state.requests,
+  split: () => state.splits,
+  settlement: () => state.settlements,
+};
+
+// A generated id must never equal any existing id of that kind (seeded or
+// imported ids are not necessarily sequential, e.g. u_9 for a fixture with
+// only two users). Loop past collisions rather than trusting the counter
+// alone.
 function nextId(prefix) {
-  state.counters[prefix] += 1;
-  return `${prefix === 'user' ? 'u' : prefix === 'payment' ? 'p' : prefix === 'request' ? 'rq' : prefix === 'split' ? 'sp' : prefix === 'settlement' ? 'st' : 'x'}_${state.counters[prefix]}`;
+  const existing = ID_MAP_FOR[prefix]();
+  let id;
+  do {
+    state.counters[prefix] += 1;
+    id = `${ID_PREFIX[prefix]}_${state.counters[prefix]}`;
+  } while (existing.has(id));
+  return id;
+}
+
+// After loading a fixture or import, set each counter so freshly generated
+// ids start past the highest numeric suffix seen for that kind (still
+// guarded by the existence check in nextId for any gaps or non-numeric ids).
+// Operates on an explicit target state (used while building newState before
+// it becomes the live `state`).
+function seedCounterFromIds(targetState, prefix, ids) {
+  const p = ID_PREFIX[prefix];
+  let max = targetState.counters[prefix] || 0;
+  for (const id of ids) {
+    const re = new RegExp(`^${p}_(\\d+)$`);
+    const m = re.exec(id);
+    if (m) {
+      const n = parseInt(m[1], 10);
+      if (n > max) max = n;
+    }
+  }
+  targetState.counters[prefix] = max;
 }
 
 function nextSeq() {
@@ -91,9 +128,19 @@ function hashPassword(password) {
 
 function verifyPassword(password, stored) {
   return new Promise((resolve, reject) => {
-    const [saltHex, keyHex] = stored.split(':');
-    const salt = Buffer.from(saltHex, 'hex');
-    const key = Buffer.from(keyHex, 'hex');
+    const [saltHex, keyHex] = (stored || '').split(':');
+    let salt, key;
+    try {
+      salt = Buffer.from(saltHex, 'hex');
+      key = Buffer.from(keyHex, 'hex');
+    } catch (e) {
+      return resolve(false);
+    }
+    if (!salt.length || key.length !== 64) {
+      // Malformed stored hash (e.g. imported from an untrusted source):
+      // never crash the process on a shape mismatch, just fail the login.
+      return resolve(false);
+    }
     crypto.scrypt(password, salt, 64, (e, derivedKey) => {
       if (e) return reject(e);
       resolve(crypto.timingSafeEqual(key, derivedKey));
@@ -171,9 +218,9 @@ function parseLimitOffset(query) {
 function authenticate(req) {
   const auth = req.headers['authorization'];
   if (!auth || typeof auth !== 'string') throw err(401, 'unauthenticated', 'missing bearer token');
-  let token = auth;
   const m = /^Bearer\s+(.+)$/i.exec(auth);
-  if (m) token = m[1];
+  if (!m) throw err(401, 'unauthenticated', 'authorization must be a bearer token');
+  const token = m[1];
   const userId = state.tokens.get(token);
   if (!userId) throw err(401, 'unauthenticated', 'unknown token');
   const user = state.users.get(userId);
@@ -256,31 +303,36 @@ function bodyEqual(a, b) {
   return JSON.stringify(canonicalize(a)) === JSON.stringify(canonicalize(b));
 }
 
-// Resolves an idempotency key. Returns { replay: response } if this exact
-// (method,path,body) was already claimed, throws 409 on key reuse with a
-// different body, or returns null meaning "proceed, then claim on success".
+// Resolves an idempotency key. The record is scoped to (authenticated user,
+// method, path, key) — the same key string on a different path is an
+// independent request, never overwriting or being resolved against the
+// other path's record (MAJOR-1). Returns { existing } with the original
+// record if this exact (method,path,body) was already claimed, throws 409
+// on key reuse with a different body on the SAME (method,path), or returns
+// { existing: null } meaning "proceed, then claim on success".
+function idempotencyMapKey(method, path, key) {
+  return `${method} ${path}\u0000${key}`;
+}
+
 function resolveIdempotency(user, method, path, key, body) {
   let userMap = state.idempotency.get(user.id);
   if (!userMap) {
     userMap = new Map();
     state.idempotency.set(user.id, userMap);
   }
-  const rec = userMap.get(key);
-  if (!rec) return { userMap, existing: null };
-  if (rec.method === method && rec.path === path && bodyEqual(rec.body, body)) {
-    return { userMap, existing: rec };
+  const mapKey = idempotencyMapKey(method, path, key);
+  const rec = userMap.get(mapKey);
+  if (!rec) return { userMap, mapKey, existing: null };
+  if (bodyEqual(rec.body, body)) {
+    return { userMap, mapKey, existing: rec };
   }
-  if (rec.method === method && rec.path === path) {
-    throw err(409, 'idempotency_key_reuse', 'idempotency key reused with a different body');
-  }
-  // Same key, different path: not a replay, treat as unused for this path.
-  return { userMap, existing: null, differentPath: true };
+  throw err(409, 'idempotency_key_reuse', 'idempotency key reused with a different body');
 }
 
-function claimIdempotency(userMap, key, method, path, body, status, response) {
+function claimIdempotency(userMap, mapKey, method, path, body, status, response) {
   // Only 2xx claims a key.
   if (status >= 200 && status < 300) {
-    userMap.set(key, { method, path, body: canonicalize(body), status, response });
+    userMap.set(mapKey, { method, path, body: canonicalize(body), status, response });
   }
 }
 
@@ -450,9 +502,11 @@ function applyFixture(fixture) {
     newState.settlementOperatorIds.add(opId);
   }
 
-  newState.counters.user = usersFixture.length;
-  newState.counters.payment = paymentsFixture.length;
-  newState.counters.request = requestsFixture.length;
+  seedCounterFromIds(newState, 'user', [...newState.users.keys()]);
+  seedCounterFromIds(newState, 'payment', [...newState.payments.keys()]);
+  seedCounterFromIds(newState, 'request', [...newState.requests.keys()]);
+  seedCounterFromIds(newState, 'split', []);
+  seedCounterFromIds(newState, 'settlement', []);
 
   state = newState;
 }
@@ -505,11 +559,167 @@ function validateImportShape(snapshot) {
   for (const k of requiredArrays) {
     if (!Array.isArray(s[k])) return false;
   }
-  if (typeof s.currency !== 'string') return false;
+  if (typeof s.currency !== 'string' || s.currency.length === 0) return false;
   if (![0, 2, 3].includes(s.minorUnits)) return false;
   if (!isPlainObject(s.counters)) return false;
   if (typeof s.seq !== 'number') return false;
   return true;
+}
+
+// Full semantic validation of an import payload (MAJOR-4): beyond the basic
+// shape check above, every reference must resolve, every id/handle/email
+// must be unique, and every record must satisfy the same invariants the
+// service otherwise enforces by construction. Throws 422 validation_failed
+// on the first problem found; the destination is untouched until this
+// function returns without throwing.
+function validateImportSemantics(s) {
+  const userIds = new Set();
+  const handles = new Set();
+  const emails = new Set();
+  for (const u of s.users) {
+    if (!isPlainObject(u)) throw err(422, 'validation_failed', 'invalid user record');
+    const { id, email, passwordHash, displayName, handle, balance } = u;
+    if (typeof id !== 'string' || !id) throw err(422, 'validation_failed', 'invalid user id');
+    if (userIds.has(id)) throw err(422, 'validation_failed', 'duplicate user id');
+    userIds.add(id);
+    if (typeof email !== 'string' || !EMAIL_RE.test(email)) throw err(422, 'validation_failed', 'invalid user email');
+    if (emails.has(email)) throw err(422, 'validation_failed', 'duplicate user email');
+    emails.add(email);
+    if (typeof handle !== 'string' || !HANDLE_RE.test(handle)) throw err(422, 'validation_failed', 'invalid user handle');
+    if (handles.has(handle)) throw err(422, 'validation_failed', 'duplicate user handle');
+    handles.add(handle);
+    if (typeof passwordHash !== 'string' || !/^[0-9a-f]{2,}:[0-9a-f]{128}$/.test(passwordHash)) {
+      // salt is any even-length hex string (16-byte salts hex-encode to 32
+      // chars, but be lenient on salt length while pinning the derived key
+      // to exactly 64 bytes / 128 hex chars, matching hashPassword above).
+      throw err(422, 'validation_failed', 'missing or invalid password hash');
+    }
+    if (typeof displayName !== 'string') throw err(422, 'validation_failed', 'invalid display_name');
+    if (!isIntegralNumber(balance) || balance < 0) {
+      throw err(422, 'validation_failed', 'invalid or negative balance');
+    }
+  }
+
+  for (const t of s.tokens) {
+    if (!isPlainObject(t) || typeof t.token !== 'string' || typeof t.userId !== 'string') {
+      throw err(422, 'validation_failed', 'invalid token record');
+    }
+    if (!userIds.has(t.userId)) throw err(422, 'validation_failed', 'token references unknown user');
+  }
+
+  const paymentIds = new Set();
+  for (const p of s.payments) {
+    if (!isPlainObject(p)) throw err(422, 'validation_failed', 'invalid payment record');
+    const { id, fromUserId, toUserId, amount, note, visibility, requestId, settlementId, createdAt } = p;
+    if (typeof id !== 'string' || !id) throw err(422, 'validation_failed', 'invalid payment id');
+    if (paymentIds.has(id)) throw err(422, 'validation_failed', 'duplicate payment id');
+    paymentIds.add(id);
+    if (!userIds.has(fromUserId) || !userIds.has(toUserId)) {
+      throw err(422, 'validation_failed', 'payment references unknown user');
+    }
+    if (!isIntegralNumber(amount) || amount < 1 || amount > 1000000000) {
+      throw err(422, 'validation_failed', 'invalid payment amount');
+    }
+    if (typeof note !== 'string') throw err(422, 'validation_failed', 'invalid payment note');
+    if (visibility !== 'public' && visibility !== 'private') {
+      throw err(422, 'validation_failed', 'invalid payment visibility');
+    }
+    if (requestId !== null && typeof requestId !== 'string') {
+      throw err(422, 'validation_failed', 'invalid payment request_id');
+    }
+    if (settlementId !== null && typeof settlementId !== 'string') {
+      throw err(422, 'validation_failed', 'invalid payment settlement_id');
+    }
+    if (typeof createdAt !== 'string') throw err(422, 'validation_failed', 'invalid payment created_at');
+  }
+
+  const requestIds = new Set();
+  for (const r of s.requests) {
+    if (!isPlainObject(r)) throw err(422, 'validation_failed', 'invalid request record');
+    const { id, requesterId, payerId, amount, note, status, paymentId, createdAt } = r;
+    if (typeof id !== 'string' || !id) throw err(422, 'validation_failed', 'invalid request id');
+    if (requestIds.has(id)) throw err(422, 'validation_failed', 'duplicate request id');
+    requestIds.add(id);
+    if (!userIds.has(requesterId) || !userIds.has(payerId)) {
+      throw err(422, 'validation_failed', 'request references unknown user');
+    }
+    if (!isIntegralNumber(amount) || amount < 1 || amount > 1000000000) {
+      throw err(422, 'validation_failed', 'invalid request amount');
+    }
+    if (typeof note !== 'string') throw err(422, 'validation_failed', 'invalid request note');
+    if (!['pending', 'paid', 'declined', 'cancelled'].includes(status)) {
+      throw err(422, 'validation_failed', 'invalid request status');
+    }
+    if (paymentId !== null && typeof paymentId !== 'string') {
+      throw err(422, 'validation_failed', 'invalid request payment_id');
+    }
+    if (paymentId !== null && !paymentIds.has(paymentId)) {
+      throw err(422, 'validation_failed', 'request references unknown payment');
+    }
+    if (typeof createdAt !== 'string') throw err(422, 'validation_failed', 'invalid request created_at');
+  }
+
+  const splitIds = new Set();
+  for (const sp of s.splits) {
+    if (!isPlainObject(sp)) throw err(422, 'validation_failed', 'invalid split record');
+    if (typeof sp.id !== 'string' || !sp.id) throw err(422, 'validation_failed', 'invalid split id');
+    if (splitIds.has(sp.id)) throw err(422, 'validation_failed', 'duplicate split id');
+    splitIds.add(sp.id);
+    if (!isIntegralNumber(sp.amount) || sp.amount < 1) throw err(422, 'validation_failed', 'invalid split amount');
+    if (!Array.isArray(sp.shares)) throw err(422, 'validation_failed', 'invalid split shares');
+    if (!Array.isArray(sp.requestIds)) throw err(422, 'validation_failed', 'invalid split requestIds');
+    for (const rid of sp.requestIds) {
+      if (typeof rid !== 'string' || !requestIds.has(rid)) {
+        throw err(422, 'validation_failed', 'split references unknown request');
+      }
+    }
+  }
+
+  const settlementIds = new Set();
+  for (const st of s.settlements) {
+    if (!isPlainObject(st)) throw err(422, 'validation_failed', 'invalid settlement record');
+    if (typeof st.id !== 'string' || !st.id) throw err(422, 'validation_failed', 'invalid settlement id');
+    if (settlementIds.has(st.id)) throw err(422, 'validation_failed', 'duplicate settlement id');
+    settlementIds.add(st.id);
+    if (!Array.isArray(st.paymentIds)) throw err(422, 'validation_failed', 'invalid settlement paymentIds');
+    for (const pid of st.paymentIds) {
+      if (typeof pid !== 'string' || !paymentIds.has(pid)) {
+        throw err(422, 'validation_failed', 'settlement references unknown payment');
+      }
+    }
+  }
+
+  for (const opId of s.settlementOperatorIds) {
+    if (typeof opId !== 'string' || !userIds.has(opId)) {
+      throw err(422, 'validation_failed', 'settlement operator references unknown user');
+    }
+  }
+
+  for (const entry of s.idempotency) {
+    if (!isPlainObject(entry) || typeof entry.userId !== 'string' || !Array.isArray(entry.records)) {
+      throw err(422, 'validation_failed', 'invalid idempotency entry');
+    }
+    if (!userIds.has(entry.userId)) {
+      throw err(422, 'validation_failed', 'idempotency record references unknown user');
+    }
+    for (const rec of entry.records) {
+      if (!isPlainObject(rec) || typeof rec.key !== 'string' || !isPlainObject(rec.rec)) {
+        throw err(422, 'validation_failed', 'invalid idempotency record');
+      }
+      const { method, path, body, status, response } = rec.rec;
+      if (typeof method !== 'string' || typeof path !== 'string' || typeof status !== 'number') {
+        throw err(422, 'validation_failed', 'invalid idempotency record shape');
+      }
+      if (body === undefined || response === undefined) {
+        throw err(422, 'validation_failed', 'invalid idempotency record body/response');
+      }
+    }
+  }
+
+  if (!isPlainObject(s.counters)) throw err(422, 'validation_failed', 'invalid counters');
+  for (const k of Object.keys(ID_PREFIX)) {
+    if (typeof s.counters[k] !== 'number') throw err(422, 'validation_failed', 'invalid counters');
+  }
 }
 
 function importSnapshot(snapshot) {
@@ -517,6 +727,10 @@ function importSnapshot(snapshot) {
     throw err(422, 'validation_failed', 'invalid import shape');
   }
   const s = deepCopy(snapshot.state);
+  // Validate everything BEFORE touching the live state, so a rejected
+  // import never mutates the destination (MAJOR-4).
+  validateImportSemantics(s);
+
   const newState = freshState();
   newState.currency = s.currency;
   newState.minorUnits = s.minorUnits;
@@ -538,6 +752,8 @@ function importSnapshot(snapshot) {
   }
   newState.counters = { ...s.counters };
   newState.seq = s.seq;
+  // Single synchronous assignment: no handler can ever observe a
+  // half-swapped state (MAJOR-3).
   state = newState;
 }
 
@@ -606,12 +822,12 @@ async function handleLogin(body) {
 
 function withIdempotency(user, method, path, req, body, fn) {
   const key = validateIdempotencyKeyHeader(req);
-  const { userMap, existing } = resolveIdempotency(user, method, path, key, body);
+  const { userMap, mapKey, existing } = resolveIdempotency(user, method, path, key, body);
   if (existing) {
     return { status: 200, body: existing.response };
   }
   const result = fn();
-  claimIdempotency(userMap, key, method, path, body, result.status, result.body);
+  claimIdempotency(userMap, mapKey, method, path, body, result.status, result.body);
   return result;
 }
 
@@ -936,21 +1152,29 @@ async function route(req, res) {
     return json(res, result.status, result.body);
   }
 
-  // Everything below requires authentication.
-  const user = authenticate(req);
+  // Authentication resolves the user from CURRENT state. To avoid ever
+  // holding a reference to a user object from a state that a concurrent
+  // reset/import has since replaced (MAJOR-3), we must NOT authenticate
+  // before an `await` and then mutate a possibly-stale reference afterward.
+  // Every branch below re-resolves `authenticate(req)` after the request
+  // body (if any) has been fully read, immediately before its synchronous
+  // critical section runs.
 
   if (method === 'GET' && pathname === '/me') {
+    const user = authenticate(req);
     return json(res, 200, userMe(user));
   }
 
   if (method === 'POST' && pathname === '/payments') {
     const body = await parseJsonBody(req);
+    const user = authenticate(req);
     const result = withIdempotency(user, method, pathname, req, body, () => doPayment(user, body));
     return json(res, result.status, result.body);
   }
 
   if (method === 'POST' && pathname === '/requests') {
     const body = await parseJsonBody(req);
+    const user = authenticate(req);
     const result = withIdempotency(user, method, pathname, req, body, () => doCreateRequest(user, body));
     return json(res, result.status, result.body);
   }
@@ -958,6 +1182,7 @@ async function route(req, res) {
   const payMatch = /^\/requests\/([^/]+)\/pay$/.exec(pathname);
   if (method === 'POST' && payMatch) {
     const body = await parseJsonBody(req);
+    const user = authenticate(req);
     const result = withIdempotency(user, method, pathname, req, body, () =>
       doPayRequest(user, payMatch[1], body)
     );
@@ -966,38 +1191,48 @@ async function route(req, res) {
 
   const declineMatch = /^\/requests\/([^/]+)\/decline$/.exec(pathname);
   if (method === 'POST' && declineMatch) {
+    const user = authenticate(req);
     const result = doDeclineRequest(user, declineMatch[1]);
     return json(res, result.status, result.body);
   }
 
   const cancelMatch = /^\/requests\/([^/]+)\/cancel$/.exec(pathname);
   if (method === 'POST' && cancelMatch) {
+    const user = authenticate(req);
     const result = doCancelRequest(user, cancelMatch[1]);
     return json(res, result.status, result.body);
   }
 
   if (method === 'GET' && pathname === '/requests') {
+    const user = authenticate(req);
     const result = doListRequests(user, url.searchParams);
     return json(res, result.status, result.body);
   }
 
   if (method === 'POST' && pathname === '/splits') {
     const body = await parseJsonBody(req);
+    const user = authenticate(req);
     const result = withIdempotency(user, method, pathname, req, body, () => doSplit(user, body));
     return json(res, result.status, result.body);
   }
 
   if (method === 'GET' && pathname === '/activity') {
+    const user = authenticate(req);
     const result = doActivity(user, url.searchParams);
     return json(res, result.status, result.body);
   }
 
   if (method === 'POST' && pathname === '/settlements') {
     const body = await parseJsonBody(req);
+    const user = authenticate(req);
     const result = withIdempotency(user, method, pathname, req, body, () => doSettlement(user, body));
     return json(res, result.status, result.body);
   }
 
+  // An unrecognised route still requires authentication first, per §6: every
+  // endpoint other than health, the _test/* endpoints, and auth/* requires a
+  // bearer token, and that check precedes 404 "route not found".
+  authenticate(req);
   throw err(404, 'not_found', 'no such route');
 }
 
