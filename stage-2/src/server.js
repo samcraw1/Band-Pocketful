@@ -18,6 +18,12 @@ const PORT = parseInt(process.env.PORT || '8080', 10);
 const HANDLE_RE = /^[a-z0-9_]{1,20}$/;
 const EMAIL_RE = /^[^@\s]+@[^@\s]+$/;
 
+// Placeholder shell until Part B (UI) replaces this with the real bundled
+// single-page app. Kept here so Part A's HTML-serving routes are already
+// wired and testable.
+const PAGE_SHELL_HTML = '<!doctype html><html><head><meta charset="utf-8"><title>Pocketful</title></head>'
+  + '<body><div id="app">Loading Pocketful...</div></body></html>';
+
 // ---------------------------------------------------------------------------
 // State
 // ---------------------------------------------------------------------------
@@ -34,22 +40,25 @@ function freshState() {
     requests: new Map(), // id -> request
     splits: new Map(), // id -> split
     settlements: new Map(), // id -> settlement
+    authorizations: new Map(), // id -> authorization (holds)
+    authorizationTtlSeconds: 600,
     settlementOperatorIds: new Set(),
     idempotency: new Map(), // userId -> Map(key -> record)
-    counters: { user: 0, payment: 0, request: 0, split: 0, settlement: 0, token: 0 },
+    counters: { user: 0, payment: 0, request: 0, split: 0, settlement: 0, authorization: 0, token: 0 },
     seq: 0, // monotonic tiebreaker for ordering
   };
 }
 
 let state = freshState();
 
-const ID_PREFIX = { user: 'u', payment: 'p', request: 'rq', split: 'sp', settlement: 'st' };
+const ID_PREFIX = { user: 'u', payment: 'p', request: 'rq', split: 'sp', settlement: 'st', authorization: 'a' };
 const ID_MAP_FOR = {
   user: () => state.users,
   payment: () => state.payments,
   request: () => state.requests,
   split: () => state.splits,
   settlement: () => state.settlements,
+  authorization: () => state.authorizations,
 };
 
 // A generated id must never equal any existing id of that kind (seeded or
@@ -127,6 +136,23 @@ function nowIso() {
   // RFC3339 with explicit offset; Date#toISOString always uses "Z" which is a
   // valid explicit offset (+00:00 equivalent).
   return new Date().toISOString().replace('Z', '+00:00');
+}
+
+// ---------------------------------------------------------------------------
+// Stage 2: authorization (hold) expiry
+// ---------------------------------------------------------------------------
+
+// Lazy, clock-true expiry: no timers are needed. Every read AND write calls
+// this once, under the lock, using a single "now" for that request, so an
+// authorization whose expires_at is at or before now is treated as expired
+// consistently for the whole request — its remainder is released back into
+// `available` and it can never be captured or voided again.
+function sweepExpiredAuthorizations(nowMs) {
+  for (const a of state.authorizations.values()) {
+    if (a.status === 'open' && Date.parse(a.expiresAt) <= nowMs) {
+      a.status = 'expired';
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -273,12 +299,38 @@ function deriveHandleFromEmail(email) {
 // Serialization helpers
 // ---------------------------------------------------------------------------
 
+// held = sum of remaining_amount over this user's OPEN (unexpired, by the
+// caller's responsibility to have swept first) holds where they are the
+// payer. available = total - held, clamped to never go negative (it
+// shouldn't mathematically, but a clamp costs nothing and is a good last
+// line of defense).
+function heldAmount(userId) {
+  let held = 0;
+  for (const a of state.authorizations.values()) {
+    if (a.fromUserId === userId && a.status === 'open') {
+      held += a.amount - a.capturedAmount;
+    }
+  }
+  return held;
+}
+
+function availableBalance(user) {
+  const held = heldAmount(user.id);
+  const available = user.balance - held;
+  return available < 0 ? 0 : available;
+}
+
 function userMe(user) {
+  const held = heldAmount(user.id);
+  const available = user.balance - held < 0 ? 0 : user.balance - held;
   return {
     user_id: user.id,
     display_name: user.displayName,
     handle: user.handle,
     balance: user.balance,
+    total: user.balance,
+    available,
+    held,
     currency: state.currency,
     minor_units: state.minorUnits,
   };
@@ -297,7 +349,29 @@ function paymentView(p) {
     visibility: p.visibility,
     request_id: p.requestId,
     settlement_id: p.settlementId,
+    authorization_id: p.authorizationId || null,
     created_at: p.createdAt,
+  };
+}
+
+function authorizationView(a) {
+  return {
+    authorization_id: a.id,
+    from_user_id: a.fromUserId,
+    from_handle: state.users.get(a.fromUserId).handle,
+    to_user_id: a.toUserId,
+    to_handle: state.users.get(a.toUserId).handle,
+    amount: a.amount,
+    captured_amount: a.capturedAmount,
+    remaining_amount: a.status === 'open' ? a.amount - a.capturedAmount : 0,
+    currency: state.currency,
+    note: a.note,
+    visibility: a.visibility,
+    status: a.status,
+    expires_at: a.expiresAt,
+    payment_id: a.paymentIds.length ? a.paymentIds[a.paymentIds.length - 1] : null,
+    payment_ids: [...a.paymentIds],
+    created_at: a.createdAt,
   };
 }
 
@@ -432,10 +506,16 @@ function applyFixture(fixture) {
   const operatorIds = Array.isArray(fixture.settlement_operator_ids)
     ? fixture.settlement_operator_ids
     : [];
+  const authorizationsFixture = Array.isArray(fixture.authorizations) ? fixture.authorizations : [];
+  const ttl = fixture.authorization_ttl_seconds === undefined ? 600 : fixture.authorization_ttl_seconds;
+  if (!isIntegralNumber(ttl) || ttl < 1) {
+    throw err(422, 'validation_failed', 'invalid authorization_ttl_seconds');
+  }
 
   const newState = freshState();
   newState.currency = currency;
   newState.minorUnits = minorUnits;
+  newState.authorizationTtlSeconds = ttl;
 
   const seenHandles = new Set();
   const seenEmails = new Set();
@@ -498,6 +578,7 @@ function applyFixture(fixture) {
       visibility: vis,
       requestId: null,
       settlementId: null,
+      authorizationId: null,
       createdAt: nowIsoFor(newState),
       seq: (newState.seq += 1),
     });
@@ -535,11 +616,84 @@ function applyFixture(fixture) {
     newState.settlementOperatorIds.add(opId);
   }
 
+  const nowMs = Date.now();
+  const heldByUser = new Map();
+  for (const a of authorizationsFixture) {
+    if (!isPlainObject(a)) throw err(422, 'validation_failed', 'invalid authorization in fixture');
+    const {
+      id,
+      from_user_id: fromUserId,
+      to_user_id: toUserId,
+      amount,
+      note,
+      visibility,
+      status,
+      expires_at: expiresAt,
+      captured_amount: capturedAmount,
+      payment_ids: paymentIds,
+    } = a;
+    if (typeof id !== 'string' || !id) throw err(422, 'validation_failed', 'invalid authorization id');
+    if (!newState.users.has(fromUserId) || !newState.users.has(toUserId)) {
+      throw err(422, 'validation_failed', 'unknown user in seeded authorization');
+    }
+    if (!isIntegralNumber(amount) || amount < 1) {
+      throw err(422, 'validation_failed', 'invalid seeded authorization amount');
+    }
+    const vis = visibility === undefined ? 'public' : visibility;
+    if (vis !== 'public' && vis !== 'private') throw err(422, 'validation_failed', 'invalid seeded visibility');
+    let st = status === undefined ? 'open' : status;
+    if (!['open', 'captured', 'voided', 'expired'].includes(st)) {
+      throw err(422, 'validation_failed', 'invalid seeded authorization status');
+    }
+    if (typeof expiresAt !== 'string' || Number.isNaN(Date.parse(expiresAt))) {
+      throw err(422, 'validation_failed', 'invalid seeded authorization expires_at');
+    }
+    const captured = capturedAmount === undefined ? 0 : capturedAmount;
+    if (!isIntegralNumber(captured) || captured < 0 || captured > amount) {
+      throw err(422, 'validation_failed', 'invalid seeded authorization captured_amount');
+    }
+    const pids = paymentIds === undefined ? [] : paymentIds;
+    if (!Array.isArray(pids) || pids.some((pid) => typeof pid !== 'string')) {
+      throw err(422, 'validation_failed', 'invalid seeded authorization payment_ids');
+    }
+    // A past expiry always wins over a seeded "open" status.
+    if (st === 'open' && Date.parse(expiresAt) <= nowMs) {
+      st = 'expired';
+    }
+    newState.authorizations.set(id, {
+      id,
+      fromUserId,
+      toUserId,
+      amount,
+      capturedAmount: captured,
+      note: typeof note === 'string' ? note : '',
+      visibility: vis,
+      status: st,
+      expiresAt,
+      paymentIds: [...pids],
+      createdAt: nowIsoFor(newState),
+      seq: (newState.seq += 1),
+    });
+    if (st === 'open') {
+      heldByUser.set(fromUserId, (heldByUser.get(fromUserId) || 0) + (amount - captured));
+    }
+  }
+
+  // A user's sum of seeded UNEXPIRED open holds must not exceed their
+  // balance, or the whole reset is rejected unchanged.
+  for (const [uid, held] of heldByUser) {
+    const u = newState.users.get(uid);
+    if (held > u.balance) {
+      throw err(422, 'validation_failed', 'seeded open holds exceed balance');
+    }
+  }
+
   seedCounterFromIds(newState, 'user', [...newState.users.keys()]);
   seedCounterFromIds(newState, 'payment', [...newState.payments.keys()]);
   seedCounterFromIds(newState, 'request', [...newState.requests.keys()]);
   seedCounterFromIds(newState, 'split', []);
   seedCounterFromIds(newState, 'settlement', []);
+  seedCounterFromIds(newState, 'authorization', [...newState.authorizations.keys()]);
 
   state = newState;
 }
@@ -566,6 +720,8 @@ function serializeState() {
     requests: [...state.requests.values()],
     splits: [...state.splits.values()],
     settlements: [...state.settlements.values()],
+    authorizations: [...state.authorizations.values()],
+    authorizationTtlSeconds: state.authorizationTtlSeconds,
     settlementOperatorIds: [...state.settlementOperatorIds],
     idempotency: [...state.idempotency.entries()].map(([userId, m]) => ({
       userId,
@@ -596,6 +752,10 @@ function validateImportShape(snapshot) {
   if (![0, 2, 3].includes(s.minorUnits)) return false;
   if (!isPlainObject(s.counters)) return false;
   if (typeof s.seq !== 'number') return false;
+  // Stage 2 additions: accept an unchanged Stage 1 export where these are
+  // simply absent — default them rather than fail shape validation.
+  if (s.authorizations !== undefined && !Array.isArray(s.authorizations)) return false;
+  if (s.authorizationTtlSeconds !== undefined && typeof s.authorizationTtlSeconds !== 'number') return false;
   return true;
 }
 
@@ -643,7 +803,7 @@ function validateImportSemantics(s) {
   const paymentIds = new Set();
   for (const p of s.payments) {
     if (!isPlainObject(p)) throw err(422, 'validation_failed', 'invalid payment record');
-    const { id, fromUserId, toUserId, amount, note, visibility, requestId, settlementId, createdAt } = p;
+    const { id, fromUserId, toUserId, amount, note, visibility, requestId, settlementId, authorizationId, createdAt } = p;
     if (typeof id !== 'string' || !id) throw err(422, 'validation_failed', 'invalid payment id');
     if (paymentIds.has(id)) throw err(422, 'validation_failed', 'duplicate payment id');
     paymentIds.add(id);
@@ -668,6 +828,9 @@ function validateImportSemantics(s) {
     }
     if (settlementId !== null && typeof settlementId !== 'string') {
       throw err(422, 'validation_failed', 'invalid payment settlement_id');
+    }
+    if (authorizationId !== undefined && authorizationId !== null && typeof authorizationId !== 'string') {
+      throw err(422, 'validation_failed', 'invalid payment authorization_id');
     }
     if (typeof createdAt !== 'string') throw err(422, 'validation_failed', 'invalid payment created_at');
   }
@@ -738,6 +901,45 @@ function validateImportSemantics(s) {
     }
   }
 
+  // Stage 2: authorizations (holds). Missing entirely (Stage 1 export) is
+  // fine -- default to none / default ttl at the importSnapshot() call site.
+  const authorizationIds = new Set();
+  const authorizations = Array.isArray(s.authorizations) ? s.authorizations : [];
+  for (const a of authorizations) {
+    if (!isPlainObject(a)) throw err(422, 'validation_failed', 'invalid authorization record');
+    const { id, fromUserId, toUserId, amount, capturedAmount, note, visibility, status, expiresAt, paymentIds: pids } = a;
+    if (typeof id !== 'string' || !id) throw err(422, 'validation_failed', 'invalid authorization id');
+    if (authorizationIds.has(id)) throw err(422, 'validation_failed', 'duplicate authorization id');
+    authorizationIds.add(id);
+    if (!userIds.has(fromUserId) || !userIds.has(toUserId)) {
+      throw err(422, 'validation_failed', 'authorization references unknown user');
+    }
+    if (!isIntegralNumber(amount) || amount < 0 || amount > Number.MAX_SAFE_INTEGER) {
+      throw err(422, 'validation_failed', 'invalid authorization amount');
+    }
+    if (!isIntegralNumber(capturedAmount) || capturedAmount < 0 || capturedAmount > amount) {
+      throw err(422, 'validation_failed', 'invalid authorization captured_amount');
+    }
+    if (typeof note !== 'string') throw err(422, 'validation_failed', 'invalid authorization note');
+    if (visibility !== 'public' && visibility !== 'private') {
+      throw err(422, 'validation_failed', 'invalid authorization visibility');
+    }
+    if (!['open', 'captured', 'voided', 'expired'].includes(status)) {
+      throw err(422, 'validation_failed', 'invalid authorization status');
+    }
+    if (typeof expiresAt !== 'string' || Number.isNaN(Date.parse(expiresAt))) {
+      throw err(422, 'validation_failed', 'invalid authorization expires_at');
+    }
+    if (!Array.isArray(pids) || pids.some((pid) => typeof pid !== 'string' || !paymentIds.has(pid))) {
+      throw err(422, 'validation_failed', 'authorization references unknown payment');
+    }
+  }
+  if (s.authorizationTtlSeconds !== undefined) {
+    if (!isIntegralNumber(s.authorizationTtlSeconds) || s.authorizationTtlSeconds < 1) {
+      throw err(422, 'validation_failed', 'invalid authorization_ttl_seconds');
+    }
+  }
+
   for (const entry of s.idempotency) {
     if (!isPlainObject(entry) || typeof entry.userId !== 'string' || !Array.isArray(entry.records)) {
       throw err(422, 'validation_failed', 'invalid idempotency entry');
@@ -761,6 +963,9 @@ function validateImportSemantics(s) {
 
   if (!isPlainObject(s.counters)) throw err(422, 'validation_failed', 'invalid counters');
   for (const k of Object.keys(ID_PREFIX)) {
+    // A Stage 1 export predates the `authorization` counter; default it so
+    // such exports still import successfully.
+    if (s.counters[k] === undefined) s.counters[k] = 0;
     if (typeof s.counters[k] !== 'number' || !Number.isFinite(s.counters[k]) || s.counters[k] < 0) {
       throw err(422, 'validation_failed', 'invalid counters');
     }
@@ -795,6 +1000,9 @@ function importSnapshot(snapshot) {
   for (const r of s.requests) newState.requests.set(r.id, r);
   for (const sp of s.splits) newState.splits.set(sp.id, sp);
   for (const st of s.settlements) newState.settlements.set(st.id, st);
+  for (const a of s.authorizations || []) newState.authorizations.set(a.id, a);
+  newState.authorizationTtlSeconds =
+    s.authorizationTtlSeconds === undefined ? 600 : s.authorizationTtlSeconds;
   for (const opId of s.settlementOperatorIds) newState.settlementOperatorIds.add(opId);
   for (const entry of s.idempotency) {
     const m = new Map();
@@ -892,7 +1100,7 @@ function doPayment(user, body) {
   if (toHandle === user.handle) throw err(422, 'self_payment', 'cannot pay yourself');
   const toUserId = state.usersByHandle.get(toHandle);
   if (!toUserId) throw err(404, 'not_found', 'no such user');
-  if (user.balance < amt) throw err(409, 'insufficient_funds', 'balance too low');
+  if (availableBalance(user) < amt) throw err(409, 'insufficient_funds', 'balance too low');
 
   const toUser = state.users.get(toUserId);
   user.balance -= amt;
@@ -907,6 +1115,7 @@ function doPayment(user, body) {
     visibility: vis,
     requestId: null,
     settlementId: null,
+    authorizationId: null,
     createdAt: nowIso(),
     seq: nextSeq(),
   };
@@ -947,7 +1156,7 @@ function doPayRequest(user, requestId, body) {
   if (!request) throw err(404, 'not_found', 'no such request');
   if (request.payerId !== user.id) throw err(403, 'forbidden', 'not your request');
   if (request.status !== 'pending') throw err(409, 'request_not_pending', 'request already settled');
-  if (user.balance < request.amount) throw err(409, 'insufficient_funds', 'balance too low');
+  if (availableBalance(user) < request.amount) throw err(409, 'insufficient_funds', 'balance too low');
 
   const toUser = state.users.get(request.requesterId);
   user.balance -= request.amount;
@@ -962,6 +1171,7 @@ function doPayRequest(user, requestId, body) {
     visibility: vis,
     requestId: request.id,
     settlementId: null,
+    authorizationId: null,
     createdAt: nowIso(),
     seq: nextSeq(),
   };
@@ -1123,7 +1333,8 @@ function doSettlement(user, body) {
   }
   for (const [uid, delta] of deltas) {
     const u = state.users.get(uid);
-    if (u.balance + delta < 0) throw err(409, 'insufficient_funds', 'settlement not affordable');
+    const held = heldAmount(u.id);
+    if (u.balance + delta - held < 0) throw err(409, 'insufficient_funds', 'settlement not affordable');
   }
 
   // Commit all-or-nothing.
@@ -1145,6 +1356,7 @@ function doSettlement(user, body) {
       visibility: t.visibility,
       requestId: null,
       settlementId: id,
+      authorizationId: null,
       createdAt: committedAt,
       seq: nextSeq(),
     };
@@ -1158,10 +1370,190 @@ function doSettlement(user, body) {
 }
 
 // ---------------------------------------------------------------------------
+// Authorizations (holds)
+// ---------------------------------------------------------------------------
+
+function doCreateAuthorization(user, body) {
+  if (!isPlainObject(body)) throw err(400, 'malformed_request', 'body must be an object');
+  const { to_handle: toHandle, amount, note, visibility } = body;
+  if (typeof toHandle !== 'string') throw err(422, 'validation_failed', 'to_handle required');
+  const amt = validateAmount(amount);
+  const n = validateNote(note);
+  const vis = validateVisibility(visibility);
+  if (toHandle === user.handle) throw err(422, 'self_payment', 'cannot pay yourself');
+  const toUserId = state.usersByHandle.get(toHandle);
+  if (!toUserId) throw err(404, 'not_found', 'no such user');
+  if (availableBalance(user) < amt) throw err(409, 'insufficient_funds', 'balance too low');
+
+  const id = nextId('authorization');
+  const createdAt = nowIso();
+  const expiresAt = new Date(Date.now() + state.authorizationTtlSeconds * 1000).toISOString().replace('Z', '+00:00');
+  const authorization = {
+    id,
+    fromUserId: user.id,
+    toUserId,
+    amount: amt,
+    capturedAmount: 0,
+    note: n,
+    visibility: vis,
+    status: 'open',
+    expiresAt,
+    paymentIds: [],
+    createdAt,
+    seq: nextSeq(),
+  };
+  state.authorizations.set(id, authorization);
+  return { status: 201, body: authorizationView(authorization) };
+}
+
+function doCaptureAuthorization(user, authorizationId, body) {
+  if (!isPlainObject(body)) throw err(400, 'malformed_request', 'body must be an object');
+  const authorization = state.authorizations.get(authorizationId);
+  if (!authorization) throw err(404, 'not_found', 'no such authorization');
+  if (authorization.toUserId !== user.id) throw err(403, 'forbidden', 'not the receiver');
+
+  const remaining = authorization.amount - authorization.capturedAmount;
+  // Precedence: captured/voided -> not_open; open-but-clock-expired -> expired.
+  if (authorization.status === 'captured' || authorization.status === 'voided') {
+    throw err(409, 'authorization_not_open', 'authorization is not open');
+  }
+  if (authorization.status === 'expired') {
+    throw err(409, 'authorization_expired', 'authorization has expired');
+  }
+
+  const { amount, final: finalRaw } = body;
+  const amt = amount === undefined ? remaining : validateAmount(amount);
+  if (finalRaw !== undefined && typeof finalRaw !== 'boolean') {
+    throw err(400, 'malformed_request', 'final must be a boolean');
+  }
+  const final = finalRaw === undefined ? true : finalRaw;
+  if (amt > remaining) throw err(422, 'capture_exceeds_authorization', 'capture exceeds remaining amount');
+
+  const fromUser = state.users.get(authorization.fromUserId);
+  const toUser = state.users.get(authorization.toUserId);
+  // Captures spend money already reserved by the hold, so they must succeed
+  // even when `available` is 0 (it always is, or near it, once the full
+  // amount is held) — we only move the ledger balances here, never check
+  // `available` again.
+  fromUser.balance -= amt;
+  toUser.balance += amt;
+  authorization.capturedAmount += amt;
+
+  const newRemaining = authorization.amount - authorization.capturedAmount;
+  if (final || newRemaining === 0) {
+    authorization.status = 'captured';
+  }
+
+  const pid = nextId('payment');
+  const payment = {
+    id: pid,
+    fromUserId: authorization.fromUserId,
+    toUserId: authorization.toUserId,
+    amount: amt,
+    note: authorization.note,
+    visibility: authorization.visibility,
+    requestId: null,
+    settlementId: null,
+    authorizationId: authorization.id,
+    createdAt: nowIso(),
+    seq: nextSeq(),
+  };
+  state.payments.set(pid, payment);
+  authorization.paymentIds.push(pid);
+
+  return { status: 201, body: paymentView(payment) };
+}
+
+function doVoidAuthorization(user, authorizationId) {
+  const authorization = state.authorizations.get(authorizationId);
+  if (!authorization) throw err(404, 'not_found', 'no such authorization');
+  if (authorization.fromUserId !== user.id) throw err(403, 'forbidden', 'not the payer');
+  if (authorization.status === 'voided') {
+    return { status: 200, body: authorizationView(authorization) };
+  }
+  if (authorization.status === 'captured' || authorization.status === 'expired') {
+    throw err(409, 'authorization_not_open', 'authorization is not open');
+  }
+  authorization.status = 'voided';
+  return { status: 200, body: authorizationView(authorization) };
+}
+
+function doListAuthorizations(user, query) {
+  const { limit, offset } = parseLimitOffset(query);
+  let direction = null;
+  if (query.has('direction')) {
+    direction = query.get('direction');
+    if (!['incoming', 'outgoing'].includes(direction)) throw err(422, 'validation_failed', 'invalid direction');
+  }
+  let status = null;
+  if (query.has('status')) {
+    status = query.get('status');
+    if (!['open', 'captured', 'voided', 'expired'].includes(status)) {
+      throw err(422, 'validation_failed', 'invalid status');
+    }
+  }
+  let items = [...state.authorizations.values()].filter(
+    (a) => a.fromUserId === user.id || a.toUserId === user.id
+  );
+  if (direction === 'incoming') items = items.filter((a) => a.toUserId === user.id);
+  if (direction === 'outgoing') items = items.filter((a) => a.fromUserId === user.id);
+  if (status) items = items.filter((a) => a.status === status);
+  items.sort((a, b) => (b.createdAt < a.createdAt ? -1 : b.createdAt > a.createdAt ? 1 : b.seq - a.seq));
+  const page = items.slice(offset, offset + limit);
+  const hasMore = offset + limit < items.length;
+  return { status: 200, body: { authorizations: page.map(authorizationView), has_more: hasMore } };
+}
+
+// ---------------------------------------------------------------------------
+// Content negotiation & static HTML shell
+// ---------------------------------------------------------------------------
+
+const STATIC_PAGE_ROUTES = new Set(['/', '/split', '/signup', '/login', '/authorizations']);
+
+function wantsHtml(req) {
+  const accept = req.headers['accept'];
+  if (!accept || typeof accept !== 'string') return false;
+  // Only prefer HTML when it's explicitly requested and preferred over JSON;
+  // a bare "*/*" (e.g. curl default) or a client that also accepts JSON
+  // explicitly should get JSON, since the JS app itself always sends
+  // "Accept: application/json" for its API fetches.
+  if (accept.includes('application/json')) return false;
+  return /text\/html/i.test(accept);
+}
+
+let cachedPageShell = null;
+function servePageShell(res) {
+  if (cachedPageShell === null) {
+    cachedPageShell = buildPageShell();
+  }
+  const buf = Buffer.from(cachedPageShell, 'utf8');
+  res.statusCode = 200;
+  res.setHeader('Content-Type', 'text/html; charset=utf-8');
+  res.setHeader('Content-Length', buf.length);
+  res.end(buf);
+}
+
+function htmlPage(res, status, kind, body) {
+  // GET /requests and GET /authorizations with Accept: text/html serve the
+  // same SPA shell; the client-side app re-fetches the JSON itself once
+  // loaded. This keeps a single source of truth for the HTML document.
+  servePageShell(res);
+}
+
+function buildPageShell() {
+  return PAGE_SHELL_HTML;
+}
+
+// ---------------------------------------------------------------------------
 // Router
 // ---------------------------------------------------------------------------
 
 async function route(req, res) {
+  // Lazy expiry sweep: every request (read or write) sees a consistent view
+  // where any hold whose expires_at has passed is already "expired", using
+  // one `now` snapshot for the whole request.
+  sweepExpiredAuthorizations(Date.now());
+
   const url = new URL(req.url, 'http://localhost');
   const pathname = url.pathname;
   const method = req.method;
@@ -1264,6 +1656,40 @@ async function route(req, res) {
   if (method === 'GET' && pathname === '/requests') {
     const user = authenticate(req);
     const result = doListRequests(user, url.searchParams);
+    if (wantsHtml(req)) return htmlPage(res, result.status, 'requests', result.body);
+    return json(res, result.status, result.body);
+  }
+
+  if (method === 'POST' && pathname === '/authorizations') {
+    authenticate(req);
+    const body = await parseJsonBody(req);
+    const user = authenticate(req);
+    const result = withIdempotency(user, method, pathname, req, body, () => doCreateAuthorization(user, body));
+    return json(res, result.status, result.body);
+  }
+
+  const captureMatch = /^\/authorizations\/([^/]+)\/capture$/.exec(pathname);
+  if (method === 'POST' && captureMatch) {
+    authenticate(req);
+    const body = await parseJsonBody(req);
+    const user = authenticate(req);
+    const result = withIdempotency(user, method, pathname, req, body, () =>
+      doCaptureAuthorization(user, captureMatch[1], body)
+    );
+    return json(res, result.status, result.body);
+  }
+
+  const voidMatch = /^\/authorizations\/([^/]+)\/void$/.exec(pathname);
+  if (method === 'POST' && voidMatch) {
+    const user = authenticate(req);
+    const result = doVoidAuthorization(user, voidMatch[1]);
+    return json(res, result.status, result.body);
+  }
+
+  if (method === 'GET' && pathname === '/authorizations') {
+    const user = authenticate(req);
+    const result = doListAuthorizations(user, url.searchParams);
+    if (wantsHtml(req)) return htmlPage(res, result.status, 'authorizations', result.body);
     return json(res, result.status, result.body);
   }
 
@@ -1287,6 +1713,14 @@ async function route(req, res) {
     const user = authenticate(req);
     const result = withIdempotency(user, method, pathname, req, body, () => doSettlement(user, body));
     return json(res, result.status, result.body);
+  }
+
+  // Browser-navigable HTML shell routes. These serve the SPA shell; the
+  // client-side router then renders the right screen. Any of these requested
+  // without an HTML-accepting client (e.g. a bare curl) still gets the shell
+  // -- these paths are never part of the JSON API surface.
+  if (method === 'GET' && STATIC_PAGE_ROUTES.has(pathname)) {
+    return servePageShell(res);
   }
 
   // An unrecognised route still requires authentication first, per §6: every
