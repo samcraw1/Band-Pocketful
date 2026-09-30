@@ -417,6 +417,114 @@ async function main() {
     assert.strictEqual(await meBalance(token), 10000 - 77);
   });
 
+  // ---- S1-FIX-2 regressions --------------------------------------------------
+
+  await test('MAJOR-A: seeded id with a huge numeric suffix never hangs id generation', async () => {
+    await resetTo(fixture({
+      users: [
+        { id: 'u_ada', email: 'ada@example.com', password: 'correct horse', display_name: 'Ada', handle: 'ada', balance: 10000 },
+        { id: 'u_bob', email: 'bob@example.com', password: 'correct horse', display_name: 'Bob', handle: 'bob', balance: 0 },
+      ],
+      payments: [{ id: 'p_9007199254740993', from_user_id: 'u_ada', to_user_id: 'u_bob', amount: 1, visibility: 'public' }],
+    }));
+    const token = await login('ada@example.com', 'correct horse');
+    // If id generation spun forever this request (and /health) would hang;
+    // a per-call timeout race proves it completes promptly instead.
+    const withTimeout = (p, ms) => Promise.race([
+      p,
+      new Promise((_, reject) => setTimeout(() => reject(new Error('timed out — id generation hung')), ms)),
+    ]);
+    const r1 = await withTimeout(req('POST', '/payments', { token, key: newKey(), body: { to_handle: 'bob', amount: 1 } }), 3000);
+    assert.strictEqual(r1.status, 201);
+    const r2 = await withTimeout(req('POST', '/payments', { token, key: newKey(), body: { to_handle: 'bob', amount: 1 } }), 3000);
+    assert.strictEqual(r2.status, 201);
+    assert.notStrictEqual(r1.json.payment_id, r2.json.payment_id);
+    assert.notStrictEqual(r1.json.payment_id, 'p_9007199254740993');
+    const health = await req('GET', '/health');
+    assert.strictEqual(health.status, 200);
+  });
+
+  await test('MAJOR-B: import accepts a 0-amount request/payment the service itself produces', async () => {
+    await resetTo(fixture());
+    const ada = await login('ada@example.com', 'correct horse');
+    const bob = await login('bob@example.com', 'correct horse');
+    // amount 1 split among 3 participants -> two 0-amount requests (equal split).
+    const split = await req('POST', '/splits', { token: ada, key: newKey(), body: { amount: 1, participant_handles: ['ada', 'bob', 'cy'] } });
+    assert.strictEqual(split.status, 201);
+    assert.ok(split.json.requests.some((r) => r.amount === 0));
+    let exp = await req('GET', '/_test/export');
+    let imp = await req('POST', '/_test/import', { body: exp.json });
+    assert.strictEqual(imp.status, 204, `0-amount split request rejected on import: ${JSON.stringify(imp.json)}`);
+    // Pay one of the 0-amount requests -> 0-amount payment; must still round-trip.
+    const zeroReq = split.json.requests.find((r) => r.amount === 0);
+    const payZero = await req('POST', `/requests/${zeroReq.request_id}/pay`, { token: bob, key: newKey(), body: {} });
+    assert.strictEqual(payZero.status, 201);
+    exp = await req('GET', '/_test/export');
+    imp = await req('POST', '/_test/import', { body: exp.json });
+    assert.strictEqual(imp.status, 204, `0-amount payment rejected on import: ${JSON.stringify(imp.json)}`);
+  });
+
+  await test('MINOR-C: import matches reset for seeded paid requests with an unseeded/numeric payment_id', async () => {
+    const fx = {
+      currency: 'EUR', minor_units: 2,
+      users: [
+        { id: 'u_ada', email: 'ada@example.com', password: 'correct horse', display_name: 'Ada', handle: 'ada', balance: 1000000000 },
+        { id: 'u_bob', email: 'bob@example.com', password: 'correct horse', display_name: 'Bob', handle: 'bob', balance: 0 },
+      ],
+      payments: [],
+      requests: [{ id: 'rq_p', requester_id: 'u_bob', payer_id: 'u_ada', amount: 5, status: 'paid', payment_id: 'p_not_seeded' }],
+    };
+    const r1 = await req('POST', '/_test/reset', { body: fx });
+    assert.strictEqual(r1.status, 204);
+    let exp = await req('GET', '/_test/export');
+    let imp = await req('POST', '/_test/import', { body: exp.json });
+    assert.strictEqual(imp.status, 204, `unseeded payment_id ref rejected on import: ${JSON.stringify(imp.json)}`);
+
+    const fxNumeric = { ...fx, requests: [{ ...fx.requests[0], payment_id: 7 }] };
+    const r2 = await req('POST', '/_test/reset', { body: fxNumeric });
+    assert.strictEqual(r2.status, 204);
+    exp = await req('GET', '/_test/export');
+    imp = await req('POST', '/_test/import', { body: exp.json });
+    assert.strictEqual(imp.status, 204, `numeric payment_id rejected on import: ${JSON.stringify(imp.json)}`);
+
+    const fxBigAmount = { ...fx, requests: [{ id: 'rq_big', requester_id: 'u_bob', payer_id: 'u_ada', amount: 2000000000 }] };
+    const r3 = await req('POST', '/_test/reset', { body: fxBigAmount });
+    assert.strictEqual(r3.status, 204);
+    exp = await req('GET', '/_test/export');
+    imp = await req('POST', '/_test/import', { body: exp.json });
+    assert.strictEqual(imp.status, 204, `seeded amount 2e9 rejected on import: ${JSON.stringify(imp.json)}`);
+  });
+
+  await test('MINOR-D: no token + malformed body = 401 (not 400); token + malformed body = 400', async () => {
+    await resetTo(fixture());
+    const token = await login('ada@example.com', 'correct horse');
+    const noTokBad = await fetch(`${BASE_URL}/payments`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Idempotency-Key': newKey() },
+      body: '{{{',
+    });
+    assert.strictEqual(noTokBad.status, 401);
+    const tokBad = await fetch(`${BASE_URL}/payments`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}`, 'Idempotency-Key': newKey() },
+      body: '{{{',
+    });
+    assert.strictEqual(tokBad.status, 400);
+  });
+
+  await test('S1-FIX-2 non-regression: straggling request authenticated before reset still cannot corrupt post-reset state', async () => {
+    await resetTo(fixture());
+    const token = await login('ada@example.com', 'correct horse');
+    const before1 = await meBalance(token);
+    assert.strictEqual(before1, 10000);
+    await resetTo(fixture());
+    // Old token must no longer resolve after reset (auth is re-checked
+    // immediately before the critical section even though it is also
+    // checked up front for MINOR-D's 401-before-400 ordering).
+    const stale = await req('POST', '/payments', { token, key: newKey(), body: { to_handle: 'bob', amount: 1 } });
+    assert.strictEqual(stale.status, 401);
+  });
+
   console.log(`\n${passed} passed, ${failed} failed`);
   if (failed > 0) process.exit(1);
 }

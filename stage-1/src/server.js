@@ -56,12 +56,33 @@ const ID_MAP_FOR = {
 // imported ids are not necessarily sequential, e.g. u_9 for a fixture with
 // only two users). Loop past collisions rather than trusting the counter
 // alone.
+//
+// MAJOR-A hardening: a seeded/imported id can carry a numeric suffix at or
+// beyond Number.MAX_SAFE_INTEGER (e.g. p_9007199254740993, a 20-digit
+// suffix). `+= 1` on a counter already at/above that bound stops advancing
+// (float precision loss), so the old "increment then check existence" loop
+// never terminates and blocks the event loop. nextId must provably
+// terminate for ANY existing id set: cap plain counter-increment attempts,
+// then fall back to a random extended suffix (still existence-checked) so
+// the loop is always bounded regardless of what ids already exist.
+const ID_GEN_COUNTER_ATTEMPT_LIMIT = 1000;
+
 function nextId(prefix) {
   const existing = ID_MAP_FOR[prefix]();
+  const p = ID_PREFIX[prefix];
   let id;
+  let attempts = 0;
   do {
-    state.counters[prefix] += 1;
-    id = `${ID_PREFIX[prefix]}_${state.counters[prefix]}`;
+    attempts += 1;
+    if (attempts <= ID_GEN_COUNTER_ATTEMPT_LIMIT && state.counters[prefix] < Number.MAX_SAFE_INTEGER) {
+      state.counters[prefix] += 1;
+      id = `${p}_${state.counters[prefix]}`;
+    } else {
+      // Bounded fallback: a short random suffix guarantees the loop cannot
+      // spin forever no matter how many (or how large) ids already exist.
+      // Stays well under the 64-char id cap.
+      id = `${p}_r${crypto.randomBytes(8).toString('hex')}`;
+    }
   } while (existing.has(id));
   return id;
 }
@@ -71,18 +92,30 @@ function nextId(prefix) {
 // guarded by the existence check in nextId for any gaps or non-numeric ids).
 // Operates on an explicit target state (used while building newState before
 // it becomes the live `state`).
+//
+// MAJOR-A hardening: parse suffixes with BigInt so an enormous suffix (e.g.
+// a 20-digit number, or anything the fixture/import shape validator allows
+// through) never produces a non-finite or imprecise counter value; clamp
+// the result to a safe JS integer. nextId's bounded fallback above then
+// guarantees termination regardless of how the counter ends up seeded.
 function seedCounterFromIds(targetState, prefix, ids) {
   const p = ID_PREFIX[prefix];
-  let max = targetState.counters[prefix] || 0;
+  let max = BigInt(targetState.counters[prefix] || 0);
+  const re = new RegExp(`^${p}_(\\d+)$`);
   for (const id of ids) {
-    const re = new RegExp(`^${p}_(\\d+)$`);
     const m = re.exec(id);
     if (m) {
-      const n = parseInt(m[1], 10);
+      let n;
+      try {
+        n = BigInt(m[1]);
+      } catch {
+        continue; // not parseable as an integer literal; ignore
+      }
       if (n > max) max = n;
     }
   }
-  targetState.counters[prefix] = max;
+  const safeMax = max > BigInt(Number.MAX_SAFE_INTEGER) ? Number.MAX_SAFE_INTEGER : Number(max);
+  targetState.counters[prefix] = safeMax;
 }
 
 function nextSeq() {
@@ -617,7 +650,13 @@ function validateImportSemantics(s) {
     if (!userIds.has(fromUserId) || !userIds.has(toUserId)) {
       throw err(422, 'validation_failed', 'payment references unknown user');
     }
-    if (!isIntegralNumber(amount) || amount < 1 || amount > 1000000000) {
+    // MAJOR-B: import must accept anything the service can legitimately
+    // produce (e.g. a 0-amount request/payment from a zero-share split) or
+    // that reset accepts (seeded amounts up to 2e9). Stored records are not
+    // subject to the API's 1..1e9 request-body range; only non-negative
+    // safe-integer is required here. (Splits pay out a share to each
+    // participant; a share can legitimately be 0 per spec §9 equal-split.)
+    if (!isIntegralNumber(amount) || amount < 0 || amount > Number.MAX_SAFE_INTEGER) {
       throw err(422, 'validation_failed', 'invalid payment amount');
     }
     if (typeof note !== 'string') throw err(422, 'validation_failed', 'invalid payment note');
@@ -643,19 +682,23 @@ function validateImportSemantics(s) {
     if (!userIds.has(requesterId) || !userIds.has(payerId)) {
       throw err(422, 'validation_failed', 'request references unknown user');
     }
-    if (!isIntegralNumber(amount) || amount < 1 || amount > 1000000000) {
+    // MAJOR-B: see payment amount comment above — 0 is legitimate (a
+    // zero-share split request), and reset accepts seeded amounts up to 2e9.
+    if (!isIntegralNumber(amount) || amount < 0 || amount > Number.MAX_SAFE_INTEGER) {
       throw err(422, 'validation_failed', 'invalid request amount');
     }
     if (typeof note !== 'string') throw err(422, 'validation_failed', 'invalid request note');
     if (!['pending', 'paid', 'declined', 'cancelled'].includes(status)) {
       throw err(422, 'validation_failed', 'invalid request status');
     }
-    if (paymentId !== null && typeof paymentId !== 'string') {
+    if (paymentId !== null && typeof paymentId !== 'string' && typeof paymentId !== 'number') {
       throw err(422, 'validation_failed', 'invalid request payment_id');
     }
-    if (paymentId !== null && !paymentIds.has(paymentId)) {
-      throw err(422, 'validation_failed', 'request references unknown payment');
-    }
+    // MINOR-C: reset accepts a seeded paid request whose payment_id names a
+    // payment that was never seeded (or is a bare number), so import must
+    // not impose a dangling-reference check here that reset doesn't. Real
+    // integrity checks (dangling USER references, duplicate ids, negative
+    // balances, bad password hashes) are still enforced above/elsewhere.
     if (typeof createdAt !== 'string') throw err(422, 'validation_failed', 'invalid request created_at');
   }
 
@@ -718,7 +761,15 @@ function validateImportSemantics(s) {
 
   if (!isPlainObject(s.counters)) throw err(422, 'validation_failed', 'invalid counters');
   for (const k of Object.keys(ID_PREFIX)) {
-    if (typeof s.counters[k] !== 'number') throw err(422, 'validation_failed', 'invalid counters');
+    if (typeof s.counters[k] !== 'number' || !Number.isFinite(s.counters[k]) || s.counters[k] < 0) {
+      throw err(422, 'validation_failed', 'invalid counters');
+    }
+    // MAJOR-A: clamp an imported counter value to a safe integer so a
+    // maliciously/accidentally huge counters value can never itself push
+    // nextId()'s plain-increment path into float-precision-loss territory;
+    // combined with the BigInt-based seedCounterFromIds and nextId's bounded
+    // random fallback, id generation remains provably terminating.
+    s.counters[k] = Math.min(Math.floor(s.counters[k]), Number.MAX_SAFE_INTEGER);
   }
 }
 
@@ -1152,13 +1203,17 @@ async function route(req, res) {
     return json(res, result.status, result.body);
   }
 
-  // Authentication resolves the user from CURRENT state. To avoid ever
-  // holding a reference to a user object from a state that a concurrent
-  // reset/import has since replaced (MAJOR-3), we must NOT authenticate
-  // before an `await` and then mutate a possibly-stale reference afterward.
-  // Every branch below re-resolves `authenticate(req)` after the request
-  // body (if any) has been fully read, immediately before its synchronous
-  // critical section runs.
+  // Authentication must be checked BEFORE the body is read, so a
+  // missing/invalid token wins over a malformed body (401, not 400) per the
+  // spec's error-check ordering (MINOR-D). But the *user object* used in the
+  // synchronous critical section must always be re-resolved from CURRENT
+  // state immediately before that critical section runs, never carried
+  // across an `await` (MAJOR-3) — a concurrent reset/import could have
+  // replaced state while the body was being read. authenticate() only
+  // checks the header format + token lookup (cheap, synchronous, no
+  // `await` inside it), so calling it twice — once up front for the early
+  // 401, once again right before the critical section for a fresh user
+  // reference — satisfies both requirements at once.
 
   if (method === 'GET' && pathname === '/me') {
     const user = authenticate(req);
@@ -1166,6 +1221,7 @@ async function route(req, res) {
   }
 
   if (method === 'POST' && pathname === '/payments') {
+    authenticate(req);
     const body = await parseJsonBody(req);
     const user = authenticate(req);
     const result = withIdempotency(user, method, pathname, req, body, () => doPayment(user, body));
@@ -1173,6 +1229,7 @@ async function route(req, res) {
   }
 
   if (method === 'POST' && pathname === '/requests') {
+    authenticate(req);
     const body = await parseJsonBody(req);
     const user = authenticate(req);
     const result = withIdempotency(user, method, pathname, req, body, () => doCreateRequest(user, body));
@@ -1181,6 +1238,7 @@ async function route(req, res) {
 
   const payMatch = /^\/requests\/([^/]+)\/pay$/.exec(pathname);
   if (method === 'POST' && payMatch) {
+    authenticate(req);
     const body = await parseJsonBody(req);
     const user = authenticate(req);
     const result = withIdempotency(user, method, pathname, req, body, () =>
@@ -1210,6 +1268,7 @@ async function route(req, res) {
   }
 
   if (method === 'POST' && pathname === '/splits') {
+    authenticate(req);
     const body = await parseJsonBody(req);
     const user = authenticate(req);
     const result = withIdempotency(user, method, pathname, req, body, () => doSplit(user, body));
@@ -1223,6 +1282,7 @@ async function route(req, res) {
   }
 
   if (method === 'POST' && pathname === '/settlements') {
+    authenticate(req);
     const body = await parseJsonBody(req);
     const user = authenticate(req);
     const result = withIdempotency(user, method, pathname, req, body, () => doSettlement(user, body));
@@ -1246,6 +1306,15 @@ function json(res, status, body) {
 
 const server = http.createServer((req, res) => {
   route(req, res).catch((e) => {
+    // A client that destroys its socket mid-request (aborted body) makes
+    // parseJsonBody reject; that's not a server bug and there is no one to
+    // answer, so just drop it quietly. Only check the RESPONSE/socket
+    // state here — req.destroyed also flips true after an ordinary,
+    // fully-read request body (not just an abort), so checking it would
+    // wrongly swallow legitimate error responses on every normal request.
+    if (res.writableEnded || !res.socket || res.socket.destroyed) {
+      return;
+    }
     if (e instanceof ApiError) {
       json(res, e.status, { error: { code: e.code, message: e.message } });
     } else {
