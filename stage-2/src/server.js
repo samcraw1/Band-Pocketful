@@ -13,16 +13,33 @@
 const http = require('http');
 const crypto = require('crypto');
 const { URL } = require('url');
+const path = require('path');
+const fs = require('fs');
 
 const PORT = parseInt(process.env.PORT || '8080', 10);
 const HANDLE_RE = /^[a-z0-9_]{1,20}$/;
 const EMAIL_RE = /^[^@\s]+@[^@\s]+$/;
 
-// Placeholder shell until Part B (UI) replaces this with the real bundled
-// single-page app. Kept here so Part A's HTML-serving routes are already
-// wired and testable.
-const PAGE_SHELL_HTML = '<!doctype html><html><head><meta charset="utf-8"><title>Pocketful</title></head>'
-  + '<body><div id="app">Loading Pocketful...</div></body></html>';
+// The SPA's CSS/JS are inlined directly into the single HTML document at
+// boot (read once, synchronously, from disk) so the served page needs no
+// further requests and no outbound network at runtime -- everything is in
+// this one image.
+const UI_CSS = fs.readFileSync(path.join(__dirname, 'ui', 'app.css'), 'utf8');
+const UI_JS = fs.readFileSync(path.join(__dirname, 'ui', 'app.js'), 'utf8');
+
+const PAGE_SHELL_HTML = `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pocketful</title>
+<style>${UI_CSS}</style>
+</head>
+<body>
+<div id="app"><main><div class="card">Loading Pocketful...</div></main></div>
+<script>${UI_JS}</script>
+</body>
+</html>`;
 
 // ---------------------------------------------------------------------------
 // State
@@ -1533,13 +1550,6 @@ function servePageShell(res) {
   res.end(buf);
 }
 
-function htmlPage(res, status, kind, body) {
-  // GET /requests and GET /authorizations with Accept: text/html serve the
-  // same SPA shell; the client-side app re-fetches the JSON itself once
-  // loaded. This keeps a single source of truth for the HTML document.
-  servePageShell(res);
-}
-
 function buildPageShell() {
   return PAGE_SHELL_HTML;
 }
@@ -1654,9 +1664,13 @@ async function route(req, res) {
   }
 
   if (method === 'GET' && pathname === '/requests') {
+    // The HTML shell itself requires no auth: it is the same static SPA
+    // document for every route, and the browser's own script re-fetches
+    // /requests as JSON using the token in localStorage. Only the JSON API
+    // branch needs a caller.
+    if (wantsHtml(req)) return servePageShell(res);
     const user = authenticate(req);
     const result = doListRequests(user, url.searchParams);
-    if (wantsHtml(req)) return htmlPage(res, result.status, 'requests', result.body);
     return json(res, result.status, result.body);
   }
 
@@ -1687,9 +1701,9 @@ async function route(req, res) {
   }
 
   if (method === 'GET' && pathname === '/authorizations') {
+    if (wantsHtml(req)) return servePageShell(res);
     const user = authenticate(req);
     const result = doListAuthorizations(user, url.searchParams);
-    if (wantsHtml(req)) return htmlPage(res, result.status, 'authorizations', result.body);
     return json(res, result.status, result.body);
   }
 
