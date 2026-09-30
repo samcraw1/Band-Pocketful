@@ -1,0 +1,13 @@
+{
+  "name": "pocketful-stage-1",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Pocketful Stage 1 — payments and settlements",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
