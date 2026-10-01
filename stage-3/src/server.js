@@ -63,6 +63,16 @@ function freshState() {
     idempotency: new Map(), // userId -> Map(key -> record)
     counters: { user: 0, payment: 0, request: 0, split: 0, settlement: 0, authorization: 0, token: 0 },
     seq: 0, // monotonic tiebreaker for ordering
+    // Stage 3: per-user indexes (so statements and as_of reads never scan every
+    // payment), statement snapshots, and the payment clock's high-water mark.
+    userPayments: new Map(), // userId -> payments the user sent or received
+    userAuths: new Map(), // payer userId -> authorizations
+    ledgerVersion: 0, // bumped whenever a payment or revision is added
+    statementCache: new Map(),
+    statementCacheVersion: 0,
+    snapshots: new Map(), // token -> frozen statement result
+    resetNs: 0n,
+    lastNs: 0n,
   };
 }
 
@@ -102,7 +112,11 @@ function nextId(prefix) {
     attempts += 1;
     if (attempts <= ID_GEN_COUNTER_ATTEMPT_LIMIT && state.counters[prefix] < Number.MAX_SAFE_INTEGER) {
       state.counters[prefix] += 1;
-      id = `${p}_${state.counters[prefix]}`;
+      // Payment ids are zero-padded so plain string order of ids agrees with
+      // creation order (statements break instant ties by id).
+      id = prefix === 'payment'
+        ? `${p}_${String(state.counters[prefix]).padStart(6, '0')}`
+        : `${p}_${state.counters[prefix]}`;
     } else {
       // Bounded fallback: a short random suffix guarantees the loop cannot
       // spin forever no matter how many (or how large) ids already exist.
@@ -149,10 +163,333 @@ function nextSeq() {
   return state.seq;
 }
 
+// ---------------------------------------------------------------------------
+// Stage 3: instants, the payment clock and the ledger
+// ---------------------------------------------------------------------------
+
+// Every instant the service compares is an integer count of nanoseconds since
+// the Unix epoch held as a BigInt, so comparisons are exact however many
+// fractional digits a client supplies. The strings shown to clients keep
+// microsecond resolution.
+//
+// Instant objects keep their ns value in a NON-enumerable property so exports
+// (which JSON-serialise state) never see a BigInt and imports re-derive it.
+const NS_PER_MS = 1000000n;
+const CLOCK_RES = 1000n; // output resolution: 1 microsecond
+
+function hidden(obj, key, value) {
+  Object.defineProperty(obj, key, { value, writable: true, enumerable: false, configurable: true });
+}
+
+let clockBaseNs = BigInt(Date.now()) * NS_PER_MS;
+let clockBaseHr = process.hrtime.bigint();
+
+// Wall clock with sub-millisecond resolution: Date.now() anchors it, hrtime
+// supplies the fraction; it re-anchors if the two ever disagree by >50ms.
+function wallNs() {
+  const hr = process.hrtime.bigint();
+  let ns = clockBaseNs + (hr - clockBaseHr);
+  const dateNs = BigInt(Date.now()) * NS_PER_MS;
+  const drift = ns > dateNs ? ns - dateNs : dateNs - ns;
+  if (drift > 50n * NS_PER_MS) {
+    clockBaseNs = dateNs;
+    clockBaseHr = hr;
+    ns = dateNs;
+  }
+  return ns;
+}
+
+// "Now" without consuming a tick: never earlier than anything already issued.
+function peekNs() {
+  const w = (wallNs() / CLOCK_RES) * CLOCK_RES;
+  return w > state.lastNs ? w : state.lastNs;
+}
+
+// A fresh, strictly increasing timestamp: every API-created record gets an
+// instant later than the reset instant and than every earlier one.
+function tickNs() {
+  const w = (wallNs() / CLOCK_RES) * CLOCK_RES;
+  const n = w > state.lastNs ? w : state.lastNs + CLOCK_RES;
+  state.lastNs = n;
+  return n;
+}
+
+function nsToIso(ns) {
+  const ms = Number(ns / NS_PER_MS);
+  const micro = Number((ns % NS_PER_MS) / 1000n);
+  return `${new Date(ms).toISOString().slice(0, 23)}${String(micro).padStart(3, '0')}+00:00`;
+}
+
+function stampNow() {
+  const ns = tickNs();
+  return { ns, iso: nsToIso(ns) };
+}
+
 function nowIso() {
-  // RFC3339 with explicit offset; Date#toISOString always uses "Z" which is a
-  // valid explicit offset (+00:00 equivalent).
-  return new Date().toISOString().replace('Z', '+00:00');
+  return nsToIso(tickNs());
+}
+
+const INSTANT_RE = /^(\d{4})-(\d{2})-(\d{2})[Tt](\d{2}):(\d{2}):(\d{2})(?:\.(\d+))?([Zz]|[+-]\d{2}:\d{2})$/;
+
+// RFC 3339 date-time with a REQUIRED offset (Z or +hh:mm); anything else
+// (naive time, bare date, empty, garbage, impossible dates) is null.
+function parseInstant(s) {
+  if (typeof s !== 'string') return null;
+  const m = INSTANT_RE.exec(s);
+  if (!m) return null;
+  const y = Number(m[1]);
+  const mo = Number(m[2]);
+  const d = Number(m[3]);
+  const H = Number(m[4]);
+  const M = Number(m[5]);
+  const S = Number(m[6]);
+  if (mo < 1 || mo > 12 || d < 1 || H > 23 || M > 59 || S > 59) return null;
+  const dt = new Date(0);
+  dt.setUTCFullYear(y, mo - 1, d);
+  dt.setUTCHours(H, M, S, 0);
+  if (dt.getUTCFullYear() !== y || dt.getUTCMonth() !== mo - 1 || dt.getUTCDate() !== d) return null;
+  let offsetMin = 0;
+  if (m[8] !== 'Z' && m[8] !== 'z') {
+    const sign = m[8][0] === '-' ? -1 : 1;
+    const oh = Number(m[8].slice(1, 3));
+    const om = Number(m[8].slice(4, 6));
+    if (oh > 23 || om > 59) return null;
+    offsetMin = sign * (oh * 60 + om);
+  }
+  const frac = m[7] ? BigInt(m[7].slice(0, 9).padEnd(9, '0')) : 0n;
+  return (BigInt(dt.getTime()) - BigInt(offsetMin) * 60000n) * NS_PER_MS + frac;
+}
+
+// A temporal query parameter: null when absent, else { raw, ns }. A '+' in the
+// offset that arrived unencoded was turned into a space by URL decoding; put
+// it back so the value the client typed is what is parsed and echoed.
+function temporalParam(query, name) {
+  if (!query.has(name)) return null;
+  let raw = query.get(name);
+  if (!/[+Zz]/.test(raw)) {
+    const m = /^(.+[Tt][\d:.]+) (\d{2}:\d{2})$/.exec(raw);
+    if (m) raw = `${m[1]}+${m[2]}`;
+  }
+  const ns = parseInstant(raw);
+  if (ns === null) throw err(422, 'validation_failed', `${name} must be an RFC 3339 instant with an offset`);
+  return { raw, ns };
+}
+
+// ---- revisions and payments ------------------------------------------------
+
+function makeRevision(revision, amount, effectiveAt, effNs, recordedAt, recNs, reason) {
+  const r = { revision, amount, effectiveAt, recordedAt, reason };
+  hidden(r, 'effNs', effNs);
+  hidden(r, 'recNs', recNs);
+  return r;
+}
+
+function revisionView(p, r) {
+  return {
+    payment_id: p.id,
+    revision: r.revision,
+    amount: r.amount,
+    effective_at: r.effectiveAt,
+    recorded_at: r.recordedAt,
+    reason: r.reason,
+  };
+}
+
+function paymentsOf(st, userId) {
+  return st.userPayments.get(userId) || [];
+}
+
+function authsOf(st, userId) {
+  return st.userAuths.get(userId) || [];
+}
+
+function indexPayment(st, p) {
+  for (const uid of p.fromUserId === p.toUserId ? [p.fromUserId] : [p.fromUserId, p.toUserId]) {
+    let list = st.userPayments.get(uid);
+    if (!list) {
+      list = [];
+      st.userPayments.set(uid, list);
+    }
+    list.push(p);
+  }
+}
+
+// Registers a payment with revision 1 (effective = recorded = created_at).
+function registerPayment(st, p, createdNs) {
+  hidden(p, 'createdNs', createdNs);
+  p.revisions = [makeRevision(1, p.amount, p.createdAt, createdNs, p.createdAt, createdNs, '')];
+  st.payments.set(p.id, p);
+  indexPayment(st, p);
+  st.ledgerVersion += 1;
+}
+
+function registerAuthorization(st, a, { createdNs, expiresNs, closedNs, baseCaptured }) {
+  hidden(a, 'createdNs', createdNs);
+  hidden(a, 'expiresNs', expiresNs);
+  hidden(a, 'closedNs', closedNs);
+  hidden(a, 'baseCaptured', baseCaptured);
+  st.authorizations.set(a.id, a);
+  let list = st.userAuths.get(a.fromUserId);
+  if (!list) {
+    list = [];
+    st.userAuths.set(a.fromUserId, list);
+  }
+  list.push(a);
+}
+
+function deltaFor(p, amount, userId) {
+  return (p.toUserId === userId ? amount : 0) - (p.fromUserId === userId ? amount : 0);
+}
+
+function latestRevision(p) {
+  return p.revisions[p.revisions.length - 1];
+}
+
+// The latest revision recorded at or before kNs, or null when none was yet.
+function selectRevision(p, kNs) {
+  for (let i = p.revisions.length - 1; i >= 0; i--) {
+    if (p.revisions[i].recNs <= kNs) return p.revisions[i];
+  }
+  return null;
+}
+
+// Balance of a wallet after every selected movement effective at or before
+// tNs (null = no upper bound).
+function totalAt(user, tNs, kNs) {
+  let total = user.openingBalance;
+  for (const p of paymentsOf(state, user.id)) {
+    const rev = selectRevision(p, kNs);
+    if (!rev) continue;
+    if (tNs !== null && rev.effNs > tNs) continue;
+    total += deltaFor(p, rev.amount, user.id);
+  }
+  return total;
+}
+
+// When a hold stops holding, as known at kNs: its close event if that was
+// already known, else its deadline (known as soon as creation is known).
+function holdEnd(a, kNs) {
+  return a.closedNs !== null && a.closedNs <= kNs ? a.closedNs : a.expiresNs;
+}
+
+// Funds held for a payer at instant tNs, as known at kNs.
+function heldAt(userId, tNs, kNs) {
+  let held = 0;
+  for (const a of authsOf(state, userId)) {
+    if (a.createdNs > kNs || a.createdNs > tNs) continue;
+    const end = holdEnd(a, kNs);
+    if (end <= a.createdNs || tNs >= end) continue;
+    let captured = a.baseCaptured;
+    for (const pid of a.paymentIds) {
+      const pay = state.payments.get(pid);
+      if (pay && pay.createdNs <= tNs && pay.createdNs <= kNs) captured += pay.amount;
+    }
+    if (a.amount > captured) held += a.amount - captured;
+  }
+  return held;
+}
+
+// ---- statements --------------------------------------------------------------
+
+// All of a user's selected movements in statement order: effective time, then
+// payment id as plain strings.
+function selectedMovements(userId, kNs) {
+  const out = [];
+  for (const p of paymentsOf(state, userId)) {
+    const rev = selectRevision(p, kNs);
+    if (!rev) continue;
+    out.push({ p, rev, delta: deltaFor(p, rev.amount, userId) });
+  }
+  out.sort((a, b) => {
+    if (a.rev.effNs !== b.rev.effNs) return a.rev.effNs < b.rev.effNs ? -1 : 1;
+    return a.p.id < b.p.id ? -1 : a.p.id > b.p.id ? 1 : 0;
+  });
+  return out;
+}
+
+// The full result of a statement read: opening and closing balances and every
+// entry of the window [fromNs, toNs) with its running balance. A window that
+// is empty or inverted has no entries and opening == closing.
+function computeStatement(user, fromNs, toNs, kNs) {
+  const moves = selectedMovements(user.id, kNs);
+  let running = user.openingBalance;
+  let opening = null;
+  const entries = [];
+  const empty = fromNs !== null && fromNs >= toNs;
+  for (const m of moves) {
+    if (fromNs !== null && m.rev.effNs < fromNs) {
+      running += m.delta;
+      continue;
+    }
+    if (opening === null) opening = running;
+    if (empty || m.rev.effNs >= toNs) break;
+    running += m.delta;
+    entries.push({ p: m.p, rev: m.rev, delta: m.delta, balanceAfter: running });
+  }
+  if (opening === null) opening = running;
+  const closing = empty ? opening : running;
+  return { opening, closing, entries };
+}
+
+function statementEntryView(e) {
+  return {
+    payment: { ...paymentView(e.p), amount: e.rev.amount },
+    delta: e.delta,
+    balance_after: e.balanceAfter,
+    revision: e.rev.revision,
+    effective_at: e.rev.effectiveAt,
+    recorded_at: e.rev.recordedAt,
+  };
+}
+
+// ---- corrections: the historical overdraft check ----------------------------
+
+// Would applying (newAmount, newEffNs) to payment p leave either party with a
+// negative TOTAL or negative AVAILABLE at any boundary up to now, under the
+// latest known revisions? Movements and hold events at one instant are
+// combined before the balance is judged.
+function wouldOverdraft(p, newAmount, newEffNs) {
+  const nowNs = peekNs();
+  for (const uid of new Set([p.fromUserId, p.toUserId])) {
+    const user = state.users.get(uid);
+    const ev = []; // [instant, change in total, change in held]
+    for (const q of paymentsOf(state, uid)) {
+      if (q === p) {
+        ev.push([newEffNs, deltaFor(q, newAmount, uid), 0]);
+      } else {
+        const rev = latestRevision(q);
+        ev.push([rev.effNs, deltaFor(q, rev.amount, uid), 0]);
+      }
+    }
+    for (const a of authsOf(state, uid)) {
+      const end = a.closedNs !== null ? a.closedNs : a.expiresNs;
+      if (end <= a.createdNs) continue; // never held
+      ev.push([a.createdNs, 0, a.amount - a.baseCaptured]);
+      let captured = a.baseCaptured;
+      for (const pid of a.paymentIds) {
+        const pay = state.payments.get(pid);
+        if (pay && pay.createdNs >= a.createdNs && pay.createdNs <= end) {
+          ev.push([pay.createdNs, 0, -pay.amount]);
+          captured += pay.amount;
+        }
+      }
+      ev.push([end, 0, -(a.amount - captured)]);
+    }
+    ev.sort((x, y) => (x[0] < y[0] ? -1 : x[0] > y[0] ? 1 : 0));
+    let total = user.openingBalance;
+    let held = 0;
+    for (let i = 0; i < ev.length; ) {
+      const t = ev[i][0];
+      if (t > nowNs) break;
+      while (i < ev.length && ev[i][0] === t) {
+        total += ev[i][1];
+        held += ev[i][2];
+        i += 1;
+      }
+      if (total < 0 || total - held < 0) return true;
+    }
+  }
+  return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -163,11 +500,14 @@ function nowIso() {
 // this once, under the lock, using a single "now" for that request, so an
 // authorization whose expires_at is at or before now is treated as expired
 // consistently for the whole request — its remainder is released back into
-// `available` and it can never be captured or voided again.
-function sweepExpiredAuthorizations(nowMs) {
+// `available` and it can never be captured or voided again. Expiry takes
+// effect at expires_at, so that is its closed_at.
+function sweepExpiredAuthorizations(nowNs) {
   for (const a of state.authorizations.values()) {
-    if (a.status === 'open' && Date.parse(a.expiresAt) <= nowMs) {
+    if (a.status === 'open' && a.expiresNs <= nowNs) {
       a.status = 'expired';
+      a.closedAt = a.expiresAt;
+      a.closedNs = a.expiresNs;
     }
   }
 }
@@ -323,10 +663,8 @@ function deriveHandleFromEmail(email) {
 // line of defense).
 function heldAmount(userId) {
   let held = 0;
-  for (const a of state.authorizations.values()) {
-    if (a.fromUserId === userId && a.status === 'open') {
-      held += a.amount - a.capturedAmount;
-    }
+  for (const a of authsOf(state, userId)) {
+    if (a.status === 'open') held += a.amount - a.capturedAmount;
   }
   return held;
 }
@@ -389,6 +727,7 @@ function authorizationView(a) {
     payment_id: a.paymentIds.length ? a.paymentIds[a.paymentIds.length - 1] : null,
     payment_ids: [...a.paymentIds],
     created_at: a.createdAt,
+    closed_at: a.closedAt === undefined ? null : a.closedAt,
   };
 }
 
@@ -533,6 +872,12 @@ function applyFixture(fixture) {
   newState.currency = currency;
   newState.minorUnits = minorUnits;
   newState.authorizationTtlSeconds = ttl;
+  // Reset time: the instant seeded records without a created_at are given. The
+  // payment clock continues strictly after it.
+  const resetNs = (wallNs() / CLOCK_RES) * CLOCK_RES;
+  const resetIso = nsToIso(resetNs);
+  newState.resetNs = resetNs;
+  newState.lastNs = resetNs;
 
   const seenHandles = new Set();
   const seenEmails = new Set();
@@ -570,6 +915,7 @@ function applyFixture(fixture) {
       displayName: u.display_name,
       handle: u.handle,
       balance: u.balance,
+      openingBalance: u.balance, // adjusted below by the seeded payments
     };
     newState.users.set(user.id, user);
     newState.usersByHandle.set(user.handle, user.id);
@@ -586,7 +932,16 @@ function applyFixture(fixture) {
     if (!isIntegralNumber(amount) || amount < 1) throw err(422, 'validation_failed', 'invalid seeded payment amount');
     const vis = visibility === undefined ? 'public' : visibility;
     if (vis !== 'public' && vis !== 'private') throw err(422, 'validation_failed', 'invalid seeded visibility');
-    newState.payments.set(id, {
+    if (newState.payments.has(id)) throw err(422, 'validation_failed', 'duplicate seeded payment id');
+    let createdAt = resetIso;
+    let createdNs = resetNs;
+    if (p.created_at !== undefined) {
+      createdNs = parseInstant(p.created_at);
+      if (createdNs === null) throw err(422, 'validation_failed', 'invalid seeded payment created_at');
+      if (createdNs > resetNs) throw err(422, 'validation_failed', 'seeded payment created_at is in the future');
+      createdAt = p.created_at;
+    }
+    registerPayment(newState, {
       id,
       fromUserId,
       toUserId,
@@ -596,9 +951,15 @@ function applyFixture(fixture) {
       requestId: null,
       settlementId: null,
       authorizationId: null,
-      createdAt: nowIsoFor(newState),
+      createdAt,
       seq: (newState.seq += 1),
-    });
+    }, createdNs);
+  }
+  // Opening balance = the seeded balance minus the net effect of the original
+  // seeded payments, so loading them leaves every fixture balance unchanged.
+  for (const p of newState.payments.values()) {
+    newState.users.get(p.fromUserId).openingBalance += p.amount;
+    newState.users.get(p.toUserId).openingBalance -= p.amount;
   }
 
   for (const r of requestsFixture) {
@@ -621,7 +982,7 @@ function applyFixture(fixture) {
       note: typeof note === 'string' ? note : '',
       status: st,
       paymentId: paymentId || null,
-      createdAt: nowIsoFor(newState),
+      createdAt: resetIso,
       seq: (newState.seq += 1),
     });
   }
@@ -633,7 +994,6 @@ function applyFixture(fixture) {
     newState.settlementOperatorIds.add(opId);
   }
 
-  const nowMs = Date.now();
   const heldByUser = new Map();
   for (const a of authorizationsFixture) {
     if (!isPlainObject(a)) throw err(422, 'validation_failed', 'invalid authorization in fixture');
@@ -662,9 +1022,19 @@ function applyFixture(fixture) {
     if (!['open', 'captured', 'voided', 'expired'].includes(st)) {
       throw err(422, 'validation_failed', 'invalid seeded authorization status');
     }
-    if (typeof expiresAt !== 'string' || Number.isNaN(Date.parse(expiresAt))) {
+    const expiresNs = parseInstant(expiresAt);
+    if (expiresNs === null) {
       throw err(422, 'validation_failed', 'invalid seeded authorization expires_at');
     }
+    let authCreatedAt = resetIso;
+    let authCreatedNs = resetNs;
+    if (a.created_at !== undefined) {
+      authCreatedNs = parseInstant(a.created_at);
+      if (authCreatedNs === null) throw err(422, 'validation_failed', 'invalid seeded authorization created_at');
+      if (authCreatedNs > resetNs) throw err(422, 'validation_failed', 'seeded authorization created_at is in the future');
+      authCreatedAt = a.created_at;
+    }
+    if (newState.authorizations.has(id)) throw err(422, 'validation_failed', 'duplicate seeded authorization id');
     const captured = capturedAmount === undefined ? 0 : capturedAmount;
     if (!isIntegralNumber(captured) || captured < 0 || captured > amount) {
       throw err(422, 'validation_failed', 'invalid seeded authorization captured_amount');
@@ -674,10 +1044,27 @@ function applyFixture(fixture) {
       throw err(422, 'validation_failed', 'invalid seeded authorization payment_ids');
     }
     // A past expiry always wins over a seeded "open" status.
-    if (st === 'open' && Date.parse(expiresAt) <= nowMs) {
+    if (st === 'open' && expiresNs <= resetNs) {
       st = 'expired';
     }
-    newState.authorizations.set(id, {
+    // Lifecycle: an open hold has not closed; one that expired by the clock
+    // closed at its deadline; seeded closed holds do not reconstruct a prior
+    // lifecycle, so they are treated as never held (closed at creation).
+    let closedAt = null;
+    let closedNs = null;
+    if (st === 'expired' && expiresNs <= resetNs && status !== 'expired') {
+      closedAt = expiresAt;
+      closedNs = expiresNs;
+    } else if (st !== 'open') {
+      closedAt = authCreatedAt;
+      closedNs = authCreatedNs;
+    }
+    let capturedByPayments = 0;
+    for (const pid of pids) {
+      const pay = newState.payments.get(pid);
+      if (pay) capturedByPayments += pay.amount;
+    }
+    registerAuthorization(newState, {
       id,
       fromUserId,
       toUserId,
@@ -688,8 +1075,14 @@ function applyFixture(fixture) {
       status: st,
       expiresAt,
       paymentIds: [...pids],
-      createdAt: nowIsoFor(newState),
+      createdAt: authCreatedAt,
+      closedAt,
       seq: (newState.seq += 1),
+    }, {
+      createdNs: authCreatedNs,
+      expiresNs,
+      closedNs,
+      baseCaptured: Math.max(0, captured - capturedByPayments),
     });
     if (st === 'open') {
       heldByUser.set(fromUserId, (heldByUser.get(fromUserId) || 0) + (amount - captured));
@@ -713,10 +1106,6 @@ function applyFixture(fixture) {
   seedCounterFromIds(newState, 'authorization', [...newState.authorizations.keys()]);
 
   state = newState;
-}
-
-function nowIsoFor() {
-  return nowIso();
 }
 
 // ---------------------------------------------------------------------------
@@ -818,12 +1207,14 @@ function validateImportSemantics(s) {
   }
 
   const paymentIds = new Set();
+  const paymentById = new Map();
   for (const p of s.payments) {
     if (!isPlainObject(p)) throw err(422, 'validation_failed', 'invalid payment record');
     const { id, fromUserId, toUserId, amount, note, visibility, requestId, settlementId, authorizationId, createdAt } = p;
     if (typeof id !== 'string' || !id) throw err(422, 'validation_failed', 'invalid payment id');
     if (paymentIds.has(id)) throw err(422, 'validation_failed', 'duplicate payment id');
     paymentIds.add(id);
+    paymentById.set(id, p);
     if (!userIds.has(fromUserId) || !userIds.has(toUserId)) {
       throw err(422, 'validation_failed', 'payment references unknown user');
     }
@@ -850,6 +1241,37 @@ function validateImportSemantics(s) {
       throw err(422, 'validation_failed', 'invalid payment authorization_id');
     }
     if (typeof createdAt !== 'string') throw err(422, 'validation_failed', 'invalid payment created_at');
+    const createdNs = parseInstant(createdAt);
+    if (createdNs === null) throw err(422, 'validation_failed', 'invalid payment created_at');
+    hidden(p, 'createdNs', createdNs);
+    // Revision history. A Stage 1/2 export has none: revision 1 is the payment
+    // as it was paid, effective and recorded at created_at.
+    if (p.revisions === undefined) {
+      p.revisions = [makeRevision(1, amount, createdAt, createdNs, createdAt, createdNs, '')];
+    } else {
+      if (!Array.isArray(p.revisions) || p.revisions.length < 1) {
+        throw err(422, 'validation_failed', 'invalid payment revisions');
+      }
+      let prevRecorded = null;
+      p.revisions = p.revisions.map((r, i) => {
+        if (!isPlainObject(r) || r.revision !== i + 1) throw err(422, 'validation_failed', 'invalid revision numbering');
+        if (!isIntegralNumber(r.amount) || r.amount < 0 || r.amount > Number.MAX_SAFE_INTEGER) {
+          throw err(422, 'validation_failed', 'invalid revision amount');
+        }
+        if (typeof r.reason !== 'string') throw err(422, 'validation_failed', 'invalid revision reason');
+        const effNs = parseInstant(r.effectiveAt);
+        const recNs = parseInstant(r.recordedAt);
+        if (effNs === null || recNs === null) throw err(422, 'validation_failed', 'invalid revision instant');
+        if (prevRecorded !== null && recNs <= prevRecorded) {
+          throw err(422, 'validation_failed', 'revision recorded_at must strictly increase');
+        }
+        prevRecorded = recNs;
+        if (i === 0 && (r.amount !== amount || effNs !== createdNs || recNs !== createdNs)) {
+          throw err(422, 'validation_failed', 'revision 1 must be the original payment');
+        }
+        return makeRevision(r.revision, r.amount, r.effectiveAt, effNs, r.recordedAt, recNs, r.reason);
+      });
+    }
   }
 
   const requestIds = new Set();
@@ -944,20 +1366,57 @@ function validateImportSemantics(s) {
     if (!['open', 'captured', 'voided', 'expired'].includes(status)) {
       throw err(422, 'validation_failed', 'invalid authorization status');
     }
-    if (typeof expiresAt !== 'string' || Number.isNaN(Date.parse(expiresAt))) {
-      throw err(422, 'validation_failed', 'invalid authorization expires_at');
-    }
+    const expiresNs = parseInstant(expiresAt);
+    if (expiresNs === null) throw err(422, 'validation_failed', 'invalid authorization expires_at');
+    const createdNs = parseInstant(a.createdAt);
+    if (createdNs === null) throw err(422, 'validation_failed', 'invalid authorization created_at');
     if (!Array.isArray(pids) || pids.some((pid) => typeof pid !== 'string' || !paymentIds.has(pid))) {
       throw err(422, 'validation_failed', 'authorization references unknown payment');
     }
+    // Lifecycle. A Stage 2 export has no closed_at: a closed hold closed at
+    // its deadline if it expired, otherwise at its last capture (or at
+    // creation when it never had one) -- the last known event time.
+    let closedAt = null;
+    let closedNs = null;
+    if (a.closedAt !== undefined && a.closedAt !== null) {
+      closedNs = parseInstant(a.closedAt);
+      if (closedNs === null) throw err(422, 'validation_failed', 'invalid authorization closed_at');
+      closedAt = a.closedAt;
+    } else if (status !== 'open') {
+      if (status === 'expired') {
+        closedAt = expiresAt;
+        closedNs = expiresNs;
+      } else {
+        closedAt = a.createdAt;
+        closedNs = createdNs;
+        for (const pid of pids) {
+          const pay = paymentById.get(pid);
+          if (pay && pay.createdNs > closedNs) {
+            closedAt = pay.createdAt;
+            closedNs = pay.createdNs;
+          }
+        }
+      }
+    }
+    if (status === 'open') {
+      closedAt = null;
+      closedNs = null;
+    }
+    let capturedByPayments = 0;
+    for (const pid of pids) capturedByPayments += paymentById.get(pid).amount;
+    a.closedAt = closedAt;
+    hidden(a, 'createdNs', createdNs);
+    hidden(a, 'expiresNs', expiresNs);
+    hidden(a, 'closedNs', closedNs);
+    hidden(a, 'baseCaptured', Math.max(0, capturedAmount - capturedByPayments));
   }
   // Mirror reset: a wallet's unexpired open holds may never exceed its total.
   {
-    const importNow = Date.now();
+    const importNow = (wallNs() / CLOCK_RES) * CLOCK_RES;
     const balanceById = new Map(s.users.map((u) => [u.id, u.balance]));
     const heldById = new Map();
     for (const a of authorizations) {
-      if (a.status !== 'open' || Date.parse(a.expiresAt) <= importNow) continue;
+      if (a.status !== 'open' || a.expiresNs <= importNow) continue;
       heldById.set(a.fromUserId, (heldById.get(a.fromUserId) || 0) + (a.amount - a.capturedAmount));
     }
     for (const [uid, held] of heldById) {
@@ -1028,11 +1487,38 @@ function importSnapshot(snapshot) {
     newState.usersByEmail.set(u.email, u.id);
   }
   for (const t of s.tokens) newState.tokens.set(t.token, t.userId);
-  for (const p of s.payments) newState.payments.set(p.id, p);
+  let maxNs = (wallNs() / CLOCK_RES) * CLOCK_RES;
+  for (const p of s.payments) {
+    newState.payments.set(p.id, p);
+    indexPayment(newState, p);
+    for (const r of p.revisions) if (r.recNs > maxNs) maxNs = r.recNs;
+    if (p.createdNs > maxNs) maxNs = p.createdNs;
+  }
   for (const r of s.requests) newState.requests.set(r.id, r);
   for (const sp of s.splits) newState.splits.set(sp.id, sp);
   for (const st of s.settlements) newState.settlements.set(st.id, st);
-  for (const a of s.authorizations || []) newState.authorizations.set(a.id, a);
+  for (const a of s.authorizations || []) {
+    newState.authorizations.set(a.id, a);
+    let list = newState.userAuths.get(a.fromUserId);
+    if (!list) {
+      list = [];
+      newState.userAuths.set(a.fromUserId, list);
+    }
+    list.push(a);
+    if (a.createdNs > maxNs) maxNs = a.createdNs;
+    if (a.closedNs !== null && a.closedNs > maxNs) maxNs = a.closedNs;
+  }
+  // Opening balance = balance minus the net effect of every payment's latest
+  // revision. For an export that already carries corrections this is exactly
+  // the opening it was taken with; for a Stage 1/2 export it is derived.
+  for (const u of newState.users.values()) u.openingBalance = u.balance;
+  for (const p of newState.payments.values()) {
+    const amount = latestRevision(p).amount;
+    newState.users.get(p.fromUserId).openingBalance += amount;
+    newState.users.get(p.toUserId).openingBalance -= amount;
+  }
+  newState.lastNs = maxNs;
+  newState.resetNs = 0n;
   newState.authorizationTtlSeconds =
     s.authorizationTtlSeconds === undefined ? 600 : s.authorizationTtlSeconds;
   for (const opId of s.settlementOperatorIds) newState.settlementOperatorIds.add(opId);
@@ -1082,7 +1568,7 @@ async function handleSignup(body) {
   if (state.usersByEmail.has(email)) throw err(409, 'email_taken', 'email already registered');
   if (state.usersByHandle.has(handle)) throw err(409, 'handle_taken', 'derived handle already taken');
   const id = nextId('user');
-  const user = { id, email, passwordHash, displayName, handle, balance: 0 };
+  const user = { id, email, passwordHash, displayName, handle, balance: 0, openingBalance: 0 };
   state.users.set(id, user);
   state.usersByHandle.set(handle, id);
   state.usersByEmail.set(email, id);
@@ -1115,7 +1601,7 @@ function withIdempotency(user, method, path, req, body, fn) {
   // The body has been fully read by now and everything from here to the end
   // of `fn` is synchronous, so take "now" and expire holds at the instant the
   // state is judged and mutated -- not at the start of a possibly slow request.
-  sweepExpiredAuthorizations(Date.now());
+  sweepExpiredAuthorizations(peekNs());
   const key = validateIdempotencyKeyHeader(req);
   const { userMap, mapKey, existing } = resolveIdempotency(user, method, path, key, body);
   if (existing) {
@@ -1142,6 +1628,7 @@ function doPayment(user, body) {
   user.balance -= amt;
   toUser.balance += amt;
   const id = nextId('payment');
+  const stamp = stampNow();
   const payment = {
     id,
     fromUserId: user.id,
@@ -1152,10 +1639,10 @@ function doPayment(user, body) {
     requestId: null,
     settlementId: null,
     authorizationId: null,
-    createdAt: nowIso(),
+    createdAt: stamp.iso,
     seq: nextSeq(),
   };
-  state.payments.set(id, payment);
+  registerPayment(state, payment, stamp.ns);
   return { status: 201, body: paymentView(payment) };
 }
 
@@ -1198,6 +1685,7 @@ function doPayRequest(user, requestId, body) {
   user.balance -= request.amount;
   toUser.balance += request.amount;
   const id = nextId('payment');
+  const stamp = stampNow();
   const payment = {
     id,
     fromUserId: user.id,
@@ -1208,10 +1696,10 @@ function doPayRequest(user, requestId, body) {
     requestId: request.id,
     settlementId: null,
     authorizationId: null,
-    createdAt: nowIso(),
+    createdAt: stamp.iso,
     seq: nextSeq(),
   };
-  state.payments.set(id, payment);
+  registerPayment(state, payment, stamp.ns);
   request.status = 'paid';
   request.paymentId = id;
   return { status: 201, body: paymentView(payment) };
@@ -1328,7 +1816,7 @@ function doActivity(user, query) {
   let items = [...state.payments.values()].filter(
     (p) => p.visibility === 'public' || p.fromUserId === user.id || p.toUserId === user.id
   );
-  items.sort((a, b) => (b.createdAt < a.createdAt ? -1 : b.createdAt > a.createdAt ? 1 : b.seq - a.seq));
+  items.sort((a, b) => (b.createdNs !== a.createdNs ? (b.createdNs < a.createdNs ? -1 : 1) : b.seq - a.seq));
   const page = items.slice(offset, offset + limit);
   const hasMore = offset + limit < items.length;
   return { status: 200, body: { payments: page.map(paymentView), has_more: hasMore } };
@@ -1375,7 +1863,8 @@ function doSettlement(user, body) {
 
   // Commit all-or-nothing.
   const id = nextId('settlement');
-  const committedAt = nowIso();
+  const committed = stampNow();
+  const committedAt = committed.iso;
   const payments = [];
   for (const t of parsed) {
     const fromUser = state.users.get(t.fromId);
@@ -1396,13 +1885,158 @@ function doSettlement(user, body) {
       createdAt: committedAt,
       seq: nextSeq(),
     };
-    state.payments.set(pid, payment);
+    registerPayment(state, payment, committed.ns);
     payments.push(paymentView(payment));
   }
   const settlement = { id, committedAt, paymentIds: payments.map((p) => p.payment_id) };
   state.settlements.set(id, settlement);
 
   return { status: 201, body: { settlement_id: id, committed_at: committedAt, payments } };
+}
+
+
+// ---------------------------------------------------------------------------
+// Stage 3: GET /me as of an instant, statements, corrections
+// ---------------------------------------------------------------------------
+
+// GET /me. Without temporal parameters this is exactly Stage 2's response.
+// With as_of and/or known_at all four money fields describe one view: the
+// movements known at known_at (default: everything known now), applied at
+// their effective times up to and including as_of (default: now), and the
+// holds as they stood at that instant.
+function doMe(user, query) {
+  const asOf = temporalParam(query, 'as_of');
+  const knownAt = temporalParam(query, 'known_at');
+  if (!asOf && !knownAt) return userMe(user);
+  const nowNs = peekNs();
+  const kNs = knownAt ? knownAt.ns : nowNs;
+  const total = totalAt(user, asOf ? asOf.ns : null, kNs);
+  const held = heldAt(user.id, asOf ? asOf.ns : nowNs, kNs);
+  const body = {
+    user_id: user.id,
+    display_name: user.displayName,
+    handle: user.handle,
+    balance: total,
+    total,
+    available: total - held,
+    held,
+    currency: state.currency,
+    minor_units: state.minorUnits,
+  };
+  if (asOf) body.as_of = asOf.raw;
+  if (knownAt) body.known_at = knownAt.raw;
+  return body;
+}
+
+function statementPage(token, snap, limit, offset) {
+  const page = snap.entries.slice(offset, offset + limit).map(statementEntryView);
+  return {
+    status: 200,
+    body: {
+      opening_balance: snap.opening,
+      entries: page,
+      closing_balance: snap.closing,
+      has_more: offset + limit < snap.entries.length,
+      snapshot: token,
+    },
+  };
+}
+
+// GET /statement. The first read computes the whole window once and freezes
+// it under an opaque snapshot token; paging that token never recomputes.
+function doStatement(user, query) {
+  if (query.has('snapshot')) {
+    for (const k of ['from', 'to', 'known_at']) {
+      if (query.has(k)) throw err(422, 'validation_failed', `${k} cannot accompany a snapshot`);
+    }
+    const { limit, offset } = parseLimitOffset(query);
+    const token = query.get('snapshot');
+    const snap = state.snapshots.get(token);
+    if (!snap || snap.userId !== user.id) throw err(404, 'not_found', 'unknown snapshot');
+    return statementPage(token, snap, limit, offset);
+  }
+  const from = temporalParam(query, 'from');
+  const to = temporalParam(query, 'to');
+  const knownAt = temporalParam(query, 'known_at');
+  const { limit, offset } = parseLimitOffset(query);
+  const nowNs = peekNs();
+  const kNs = knownAt ? knownAt.ns : nowNs;
+  // Default `to` is now, frozen at this read; nothing is effective after now,
+  // so +1ns makes the window cover everything up to and including this instant.
+  const toNs = to ? to.ns : nowNs + 1n;
+  const fromNs = from ? from.ns : null;
+
+  // Identical reads of an unchanged ledger share one frozen result, which keeps
+  // the memory held by snapshots proportional to distinct results.
+  if (state.statementCacheVersion !== state.ledgerVersion) {
+    state.statementCache = new Map();
+    state.statementCacheVersion = state.ledgerVersion;
+  }
+  const cacheKey = `${user.id}|${fromNs === null ? '-' : fromNs}|${to ? toNs : 'now'}|${knownAt ? kNs : 'now'}`;
+  let snap = state.statementCache.get(cacheKey);
+  if (!snap) {
+    snap = { userId: user.id, ...computeStatement(user, fromNs, toNs, kNs) };
+    state.statementCache.set(cacheKey, snap);
+  }
+  const token = `snap_${crypto.randomBytes(18).toString('base64url')}`;
+  state.snapshots.set(token, snap);
+  return statementPage(token, snap, limit, offset);
+}
+
+function doCorrection(user, paymentId, body) {
+  if (!isPlainObject(body)) throw err(400, 'malformed_request', 'body must be an object');
+  const p = state.payments.get(paymentId);
+  if (!p) throw err(404, 'not_found', 'no such payment');
+  if (p.fromUserId !== user.id) throw err(403, 'forbidden', 'only the sender may correct a payment');
+  if (p.settlementId !== null || p.authorizationId) {
+    throw err(422, 'linked_payment_immutable', 'settlement members and captures cannot be corrected');
+  }
+
+  const { expected_revision: expectedRevision, amount, effective_at: effectiveAt, reason } = body;
+  if (!isIntegralNumber(expectedRevision) || expectedRevision < 1) {
+    throw err(422, 'validation_failed', 'expected_revision must be a positive integer');
+  }
+  if (!isIntegralNumber(amount) || amount < 0 || amount > 1000000000) {
+    throw err(422, 'validation_failed', 'amount must be an integer from 0 to 1000000000');
+  }
+  if (typeof reason !== 'string' || [...reason].length < 1 || [...reason].length > 200) {
+    throw err(422, 'validation_failed', 'reason must be 1..200 characters');
+  }
+  const effNs = parseInstant(effectiveAt);
+  if (effNs === null) throw err(422, 'validation_failed', 'effective_at must be an RFC 3339 instant with an offset');
+  if (effNs > peekNs()) throw err(422, 'validation_failed', 'effective_at cannot be in the future');
+
+  const latest = latestRevision(p);
+  if (expectedRevision !== latest.revision) throw err(409, 'stale_revision', 'the payment has a newer revision');
+
+  // The difference moves between the same two wallets: an increase debits the
+  // sender, a decrease debits the receiver. A current shortfall wins over a
+  // historical one.
+  const delta = amount - latest.amount;
+  const sender = state.users.get(p.fromUserId);
+  const receiver = state.users.get(p.toUserId);
+  if (delta > 0 && availableBalance(sender) < delta) throw err(409, 'insufficient_funds', 'sender cannot afford the increase');
+  if (delta < 0 && availableBalance(receiver) < -delta) throw err(409, 'insufficient_funds', 'receiver cannot afford the decrease');
+  if (wouldOverdraft(p, amount, effNs)) throw err(409, 'historical_overdraft', 'the correction would overdraw a wallet in the past');
+
+  let recNs = tickNs();
+  if (recNs <= latest.recNs) {
+    recNs = latest.recNs + CLOCK_RES;
+    if (recNs > state.lastNs) state.lastNs = recNs;
+  }
+  const revision = makeRevision(latest.revision + 1, amount, effectiveAt, effNs, nsToIso(recNs), recNs, reason);
+  p.revisions.push(revision);
+  sender.balance -= delta;
+  receiver.balance += delta;
+  state.ledgerVersion += 1;
+  return { status: 201, body: revisionView(p, revision) };
+}
+
+function doListRevisions(user, paymentId) {
+  const p = state.payments.get(paymentId);
+  // A third party learns nothing about the payment, public or not.
+  if (!p || (p.fromUserId !== user.id && p.toUserId !== user.id)) throw err(404, 'not_found', 'no such payment');
+  return { status: 200, body: { revisions: p.revisions.map((r) => revisionView(p, r)) } };
 }
 
 // ---------------------------------------------------------------------------
@@ -1422,11 +2056,9 @@ function doCreateAuthorization(user, body) {
   if (availableBalance(user) < amt) throw err(409, 'insufficient_funds', 'balance too low');
 
   const id = nextId('authorization');
-  // One clock read: expires_at is exactly created_at + ttl, never off by the
-  // milliseconds between two separate reads.
-  const createdMs = Date.now();
-  const createdAt = new Date(createdMs).toISOString().replace('Z', '+00:00');
-  const expiresAt = new Date(createdMs + state.authorizationTtlSeconds * 1000).toISOString().replace('Z', '+00:00');
+  // One clock read: expires_at is exactly created_at + ttl.
+  const created = stampNow();
+  const expiresNs = created.ns + BigInt(state.authorizationTtlSeconds) * 1000000000n;
   const authorization = {
     id,
     fromUserId: user.id,
@@ -1436,12 +2068,13 @@ function doCreateAuthorization(user, body) {
     note: n,
     visibility: vis,
     status: 'open',
-    expiresAt,
+    expiresAt: nsToIso(expiresNs),
     paymentIds: [],
-    createdAt,
+    createdAt: created.iso,
+    closedAt: null,
     seq: nextSeq(),
   };
-  state.authorizations.set(id, authorization);
+  registerAuthorization(state, authorization, { createdNs: created.ns, expiresNs, closedNs: null, baseCaptured: 0 });
   return { status: 201, body: authorizationView(authorization) };
 }
 
@@ -1478,9 +2111,12 @@ function doCaptureAuthorization(user, authorizationId, body) {
   toUser.balance += amt;
   authorization.capturedAmount += amt;
 
+  const stamp = stampNow();
   const newRemaining = authorization.amount - authorization.capturedAmount;
   if (final || newRemaining === 0) {
     authorization.status = 'captured';
+    authorization.closedAt = stamp.iso;
+    authorization.closedNs = stamp.ns;
   }
 
   const pid = nextId('payment');
@@ -1494,10 +2130,10 @@ function doCaptureAuthorization(user, authorizationId, body) {
     requestId: null,
     settlementId: null,
     authorizationId: authorization.id,
-    createdAt: nowIso(),
+    createdAt: stamp.iso,
     seq: nextSeq(),
   };
-  state.payments.set(pid, payment);
+  registerPayment(state, payment, stamp.ns);
   authorization.paymentIds.push(pid);
 
   return { status: 201, body: paymentView(payment) };
@@ -1513,7 +2149,10 @@ function doVoidAuthorization(user, authorizationId) {
   if (authorization.status === 'captured' || authorization.status === 'expired') {
     throw err(409, 'authorization_not_open', 'authorization is not open');
   }
+  const stamp = stampNow();
   authorization.status = 'voided';
+  authorization.closedAt = stamp.iso;
+  authorization.closedNs = stamp.ns;
   return { status: 200, body: authorizationView(authorization) };
 }
 
@@ -1537,7 +2176,7 @@ function doListAuthorizations(user, query) {
   if (direction === 'incoming') items = items.filter((a) => a.toUserId === user.id);
   if (direction === 'outgoing') items = items.filter((a) => a.fromUserId === user.id);
   if (status) items = items.filter((a) => a.status === status);
-  items.sort((a, b) => (b.createdAt < a.createdAt ? -1 : b.createdAt > a.createdAt ? 1 : b.seq - a.seq));
+  items.sort((a, b) => (b.createdNs !== a.createdNs ? (b.createdNs < a.createdNs ? -1 : 1) : b.seq - a.seq));
   const page = items.slice(offset, offset + limit);
   const hasMore = offset + limit < items.length;
   return { status: 200, body: { authorizations: page.map(authorizationView), has_more: hasMore } };
@@ -1584,7 +2223,7 @@ async function route(req, res) {
   // Lazy expiry sweep: every request (read or write) sees a consistent view
   // where any hold whose expires_at has passed is already "expired", using
   // one `now` snapshot for the whole request.
-  sweepExpiredAuthorizations(Date.now());
+  sweepExpiredAuthorizations(peekNs());
 
   const url = new URL(req.url, 'http://localhost');
   const pathname = url.pathname;
@@ -1641,7 +2280,31 @@ async function route(req, res) {
 
   if (method === 'GET' && pathname === '/me') {
     const user = authenticate(req);
-    return json(res, 200, userMe(user));
+    return json(res, 200, doMe(user, url.searchParams));
+  }
+
+  if (method === 'GET' && pathname === '/statement') {
+    const user = authenticate(req);
+    const result = doStatement(user, url.searchParams);
+    return json(res, result.status, result.body);
+  }
+
+  const revisionsMatch = /^\/payments\/([^/]+)\/revisions$/.exec(pathname);
+  if (method === 'GET' && revisionsMatch) {
+    const user = authenticate(req);
+    const result = doListRevisions(user, revisionsMatch[1]);
+    return json(res, result.status, result.body);
+  }
+
+  const correctionMatch = /^\/payments\/([^/]+)\/corrections$/.exec(pathname);
+  if (method === 'POST' && correctionMatch) {
+    authenticate(req);
+    const body = await parseJsonBody(req);
+    const user = authenticate(req);
+    const result = withIdempotency(user, method, pathname, req, body, () =>
+      doCorrection(user, correctionMatch[1], body)
+    );
+    return json(res, result.status, result.body);
   }
 
   if (method === 'POST' && pathname === '/payments') {
@@ -1805,7 +2468,7 @@ server.on('clientError', (err_, socket) => {
 
 server.listen(PORT, '0.0.0.0', () => {
   // eslint-disable-next-line no-console
-  console.log(`pocketful stage-2 listening on 0.0.0.0:${PORT}`);
+  console.log(`pocketful stage-3 listening on 0.0.0.0:${PORT}`);
 });
 
 module.exports = { server, applyFixture };
