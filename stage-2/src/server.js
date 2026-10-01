@@ -1422,8 +1422,11 @@ function doCreateAuthorization(user, body) {
   if (availableBalance(user) < amt) throw err(409, 'insufficient_funds', 'balance too low');
 
   const id = nextId('authorization');
-  const createdAt = nowIso();
-  const expiresAt = new Date(Date.now() + state.authorizationTtlSeconds * 1000).toISOString().replace('Z', '+00:00');
+  // One clock read: expires_at is exactly created_at + ttl, never off by the
+  // milliseconds between two separate reads.
+  const createdMs = Date.now();
+  const createdAt = new Date(createdMs).toISOString().replace('Z', '+00:00');
+  const expiresAt = new Date(createdMs + state.authorizationTtlSeconds * 1000).toISOString().replace('Z', '+00:00');
   const authorization = {
     id,
     fromUserId: user.id,

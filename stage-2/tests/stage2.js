@@ -187,6 +187,16 @@ async function main() {
     await checkInvariants(w);
   });
 
+  await test('expires_at is exactly created_at + ttl on every create (single clock read)', async () => {
+    const w = await world(FX({ authorization_ttl_seconds: 300, users: [U('ada', 1000000), U('bob', 0)] }));
+    const seen = new Set();
+    for (let i = 0; i < 60; i++) {
+      const a = (await auth(w.ada, 'bob', 1)).json;
+      seen.add(Date.parse(a.expires_at) - Date.parse(a.created_at));
+    }
+    assert.deepStrictEqual([...seen], [300000]);
+  });
+
   await test('ttl from fixture drives expires_at', async () => {
     const w = await world(FX({ authorization_ttl_seconds: 90 }));
     const r = await auth(w.ada, 'bob', 100);
