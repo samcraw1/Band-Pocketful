@@ -331,8 +331,7 @@ async function main() {
     const k = K();
     const c = await correct(w.ada, p.payment_id, { expected_revision: 1, amount: 400, effective_at: p.created_at, reason: 'corrected amount' }, k);
     assert.strictEqual(c.status, 201, c.text);
-    assert.deepStrictEqual(Object.keys(c.json).sort(), ['amount', 'correction_batch_id', 'effective_at', 'payment_id', 'reason', 'recorded_at', 'revision']);
-    assert.strictEqual(c.json.correction_batch_id, null);
+    assert.deepStrictEqual(Object.keys(c.json).sort(), ['amount', 'effective_at', 'payment_id', 'reason', 'recorded_at', 'revision']);
     assert.deepStrictEqual([c.json.payment_id, c.json.revision, c.json.amount, c.json.effective_at, c.json.reason], [p.payment_id, 2, 400, p.created_at, 'corrected amount']);
     assert.ok(c.json.recorded_at > p.created_at);
     assert.deepStrictEqual(await bal(w), { ada: 9600, bob: 2900, cy: 500 }, 'a decrease returns 600 from the receiver');
@@ -348,7 +347,7 @@ async function main() {
     assert.deepStrictEqual([s.entries[0].payment.amount, s.entries[0].revision, s.entries[0].delta], [1500, 3, -1500], 'statement shows the selected amount');
     const rev = (await req('GET', `/payments/${p.payment_id}/revisions`, { token: w.ada })).json.revisions;
     assert.deepStrictEqual(rev.map((r) => [r.revision, r.amount, r.reason]), [[1, 1000, ''], [2, 400, 'corrected amount'], [3, 1500, 'bigger']]);
-    assert.deepStrictEqual(Object.keys(rev[0]).sort(), ['amount', 'correction_batch_id', 'effective_at', 'payment_id', 'reason', 'recorded_at', 'revision']);
+    assert.deepStrictEqual(Object.keys(rev[0]).sort(), ['amount', 'effective_at', 'payment_id', 'reason', 'recorded_at', 'revision']);
     assert.ok(rev[0].recorded_at < rev[1].recorded_at && rev[1].recorded_at < rev[2].recorded_at, 'recorded times strictly increase');
     assert.strictEqual((await req('GET', '/activity', { token: w.ada })).json.payments.find((x) => x.payment_id === p.payment_id).amount, 1000);
   });

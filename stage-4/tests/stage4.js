@@ -345,7 +345,8 @@ async function main() {
     assert.ok(r.json.recorded_at > prior.recorded_at, 'strictly later than every member previous recorded_at');
     assert.ok(r.json.recorded_at > ps[31].created_at);
     const list = await revisions(w.ada, ps[5].payment_id);
-    assert.deepStrictEqual(list.map((x) => [x.revision, x.correction_batch_id]), [[1, null], [2, r.json.correction_batch_id]]);
+    assert.deepStrictEqual(list.map((x) => [x.revision, x.correction_batch_id ?? null]), [[1, null], [2, r.json.correction_batch_id]]);
+    assert.ok(!('correction_batch_id' in list[0]), 'non-batch revisions keep the Stage 3 shape');
     const s = await stmt(w.ada, '?limit=200');
     assert.strictEqual(s.opening_balance + s.entries.reduce((a, e) => a + e.delta, 0), s.closing_balance);
     assert.strictEqual(await sumAt(w, ''), w.total);
@@ -411,6 +412,7 @@ async function main() {
     assert.strictEqual((await correct(w.bob, ord.payment_id, { expected_revision: 2, amount: 120, effective_at: ord.created_at, reason: 'x' })).status, 201);
     const rv = await revisions(w.ada, m1.payment_id);
     assert.deepStrictEqual([rv.length, rv[1].correction_batch_id], [2, ok.json.correction_batch_id]);
+    assert.strictEqual(rv[0].correction_batch_id, undefined);
     // a settlement member can be refunded and still be batch-corrected as a whole
     assert.strictEqual((await refund(w.bob, m1.payment_id, 20)).status, 201);
     err(await batch(w.ada, [item(m1.payment_id, 10, eff, { expected_revision: 2 }), item(m2.payment_id, 40, eff, { expected_revision: 2 }), item(m3.payment_id, 5, eff, { expected_revision: 2 })]), 422, 'refund_exceeds_payment');
@@ -509,7 +511,7 @@ async function main() {
     assert.deepStrictEqual((await batch(w.ada, bodyB, kb)).json, b1.json);
     const rr = await refund(w.bob, 'pa', 100, kr);
     assert.deepStrictEqual([rr.status, rr.json.payment_id], [200, r1.json.payment_id]);
-    assert.deepStrictEqual((await revisions(w.ada, 'pa')).map((x) => [x.revision, x.correction_batch_id]), [[1, null], [2, b1.json.correction_batch_id]]);
+    assert.deepStrictEqual((await revisions(w.ada, 'pa')).map((x) => [x.revision, x.correction_batch_id ?? null]), [[1, null], [2, b1.json.correction_batch_id]]);
     err(await refund(w.bob, 'pa', 701), 422, 'refund_exceeds_payment');
     assert.strictEqual((await refund(w.bob, 'pa', 700)).status, 201);
     // new batch ids do not collide with imported ones
@@ -604,7 +606,7 @@ async function main() {
         if (label === 's3') {
           assert.strictEqual((await me(tok.ada, `?as_of=${enc('2000-01-01T00:00:00+00:00')}`)).balance, 10000, 's3: opening retained');
           const rv = await revisions(tok.ada, p1.payment_id);
-          assert.deepStrictEqual(rv.map((x) => [x.revision, x.amount, x.reason, x.correction_batch_id]), [[1, 700, '', null], [2, 600, 'stage 3', null]], 's3: corrections retained');
+          assert.deepStrictEqual(rv.map((x) => [x.revision, x.amount, x.reason, x.correction_batch_id ?? null]), [[1, 700, '', null], [2, 600, 'stage 3', null]], 's3: corrections retained');
           const c2 = await correct(tok.ada, p1.payment_id, { ...correctionBody, expected_revision: 2, amount: 650, reason: 'again' });
           assert.strictEqual(c2.status, 201, c2.text);
           // a Stage 3 export carries no snapshots: the token is gone after import

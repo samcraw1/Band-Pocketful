@@ -287,16 +287,19 @@ function makeRevision(revision, amount, effectiveAt, effNs, recordedAt, recNs, r
   return r;
 }
 
+// A revision as clients see it. Only revisions made by a batch carry
+// correction_batch_id; every other revision keeps exactly the Stage 3 shape.
 function revisionView(p, r) {
-  return {
+  const view = {
     payment_id: p.id,
     revision: r.revision,
     amount: r.amount,
     effective_at: r.effectiveAt,
     recorded_at: r.recordedAt,
     reason: r.reason,
-    correction_batch_id: r.correctionBatchId === undefined ? null : r.correctionBatchId,
   };
+  if (r.correctionBatchId) view.correction_batch_id = r.correctionBatchId;
+  return view;
 }
 
 function paymentsOf(st, userId) {
