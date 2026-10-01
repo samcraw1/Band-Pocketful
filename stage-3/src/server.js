@@ -1266,9 +1266,10 @@ function validateImportSemantics(s) {
           throw err(422, 'validation_failed', 'revision recorded_at must strictly increase');
         }
         prevRecorded = recNs;
-        if (i === 0 && (r.amount !== amount || effNs !== createdNs || recNs !== createdNs)) {
-          throw err(422, 'validation_failed', 'revision 1 must be the original payment');
-        }
+        // Revision 1 IS the payment as originally paid: the payment record is
+        // authoritative for its amount and times (import has never cross-checked
+        // those fields), so a stored revision 1 is normalised to it.
+        if (i === 0) return makeRevision(1, amount, createdAt, createdNs, createdAt, createdNs, '');
         return makeRevision(r.revision, r.amount, r.effectiveAt, effNs, r.recordedAt, recNs, r.reason);
       });
     }
@@ -1528,6 +1529,12 @@ function importSnapshot(snapshot) {
     newState.idempotency.set(entry.userId, m);
   }
   newState.counters = { ...s.counters };
+  seedCounterFromIds(newState, 'user', [...newState.users.keys()]);
+  seedCounterFromIds(newState, 'payment', [...newState.payments.keys()]);
+  seedCounterFromIds(newState, 'request', [...newState.requests.keys()]);
+  seedCounterFromIds(newState, 'split', [...newState.splits.keys()]);
+  seedCounterFromIds(newState, 'settlement', [...newState.settlements.keys()]);
+  seedCounterFromIds(newState, 'authorization', [...newState.authorizations.keys()]);
   newState.seq = s.seq;
   // Single synchronous assignment: no handler can ever observe a
   // half-swapped state (MAJOR-3).

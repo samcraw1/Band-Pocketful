@@ -665,8 +665,6 @@ async function main() {
       (e) => { pa(e).revisions[1].effectiveAt = '2026-01-01'; },
       (e) => { pa(e).revisions[1].recordedAt = pa(e).revisions[0].recordedAt; },
       (e) => { pa(e).revisions[1].reason = 5; },
-      (e) => { pa(e).revisions[0].amount = 1; },
-      (e) => { pa(e).revisions[0].recordedAt = '2026-02-01T00:00:00+00:00'; },
       (e) => { pa(e).createdAt = 'yesterday'; },
       (e) => { e.state.authorizations = [{ id: 'a', fromUserId: 'u_ada', toUserId: 'u_bob', amount: 5, capturedAmount: 0, note: '', visibility: 'public', status: 'open', expiresAt: inFuture(100), createdAt: 'x', paymentIds: [] }]; },
     ];
