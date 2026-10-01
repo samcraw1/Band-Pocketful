@@ -7,6 +7,7 @@
  *   BASE_URL=http://localhost:8080 node tests/stage2.js
  */
 const assert = require('assert');
+const net = require('net');
 
 const BASE_URL = process.env.BASE_URL || 'http://localhost:8080';
 let passed = 0;
@@ -521,15 +522,62 @@ async function main() {
     }
   });
 
-  await test('import: seeded open holds beyond a wallet\'s total in the snapshot are refused (never negative available)', async () => {
+  await test('import mirrors reset: unexpired open holds beyond a wallet total -> 422, destination unchanged', async () => {
     const w = await world();
     await auth(w.ada, 'bob', 1000);
     const exp = JSON.parse((await req('GET', '/_test/export')).text);
-    exp.state.users.find((u) => u.id === 'u_ada').balance = 10;
-    const r = await req('POST', '/_test/import', { rawBody: JSON.stringify(exp) });
-    assert.ok([422, 204].includes(r.status));
+    const bad = JSON.parse(JSON.stringify(exp));
+    bad.state.users.find((u) => u.id === 'u_ada').balance = 10;
+    err(await req('POST', '/_test/import', { rawBody: JSON.stringify(bad) }), 422, 'validation_failed');
+    const bad2 = JSON.parse(JSON.stringify(exp));
+    bad2.state.authorizations[0].amount = 99999999;
+    err(await req('POST', '/_test/import', { rawBody: JSON.stringify(bad2) }), 422, 'validation_failed');
     const m = await me(w.ada);
-    assert.ok(m.available >= 0 && m.held >= 0);
+    assert.deepStrictEqual([m.total, m.held, m.available], [10000, 1000, 9000]);
+  });
+
+  await test('import still accepts valid exports: hold == total, expired/closed holds above total, partial captures', async () => {
+    const w = await world();
+    const full = (await auth(w.cy, 'bob', 500)).json; // hold equal to the whole wallet
+    const part = (await auth(w.ada, 'bob', 2000)).json;
+    await capture(w.bob, part.authorization_id, { amount: 500, final: false });
+    const exp = JSON.parse((await req('GET', '/_test/export')).text);
+    assert.strictEqual((await req('POST', '/_test/import', { rawBody: JSON.stringify(exp) })).status, 204);
+    const ok = JSON.parse(JSON.stringify(exp));
+    const a = ok.state.authorizations.find((x) => x.id === full.authorization_id);
+    a.status = 'voided';
+    a.amount = 99999999; // closed holds are not constrained
+    assert.strictEqual((await req('POST', '/_test/import', { rawBody: JSON.stringify(ok) })).status, 204);
+    const ex = JSON.parse(JSON.stringify(exp));
+    const b = ex.state.authorizations.find((x) => x.id === full.authorization_id);
+    b.amount = 99999999;
+    b.expiresAt = inFuture(-7200); // expired by the clock: holds nothing
+    assert.strictEqual((await req('POST', '/_test/import', { rawBody: JSON.stringify(ex) })).status, 204);
+    const m = await me(w.cy);
+    assert.deepStrictEqual([m.held, m.available], [0, 500]);
+  });
+
+  await test('expiry is judged when the capture mutates state: a slow body that completes after expires_at -> 409', async () => {
+    const w = await world(FX({ authorization_ttl_seconds: 2 }));
+    const a = (await auth(w.ada, 'bob', 100)).json;
+    const body = JSON.stringify({ amount: 100 });
+    const head = `POST /authorizations/${a.authorization_id}/capture HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer ${w.bob}\r\nIdempotency-Key: ${K()}\r\nContent-Type: application/json\r\nContent-Length: ${body.length}\r\n\r\n`;
+    const u = new URL(BASE_URL);
+    const sock = net.connect(Number(u.port || 80), u.hostname);
+    sock.on('error', () => {});
+    await new Promise((r) => sock.once('connect', r));
+    let resp = '';
+    sock.on('data', (d) => { resp += d; });
+    await sleep(1700);
+    sock.write(head + body.slice(0, 3)); // headers arrive before expires_at
+    await sleep(700); // ...now past it
+    sock.write(body.slice(3));
+    await sleep(300);
+    sock.end();
+    assert.ok(resp.startsWith('HTTP/1.1 409'), resp.split('\r\n')[0]);
+    assert.ok(resp.includes('authorization_expired'), resp);
+    assert.strictEqual((await me(w.bob)).total, 2500);
+    await checkInvariants(w);
   });
 
   await test('Stage 1 export (no authorizations/ttl/counters) imports; lost-response retry replays after import', async () => {

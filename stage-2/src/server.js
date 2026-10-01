@@ -951,6 +951,21 @@ function validateImportSemantics(s) {
       throw err(422, 'validation_failed', 'authorization references unknown payment');
     }
   }
+  // Mirror reset: a wallet's unexpired open holds may never exceed its total.
+  {
+    const importNow = Date.now();
+    const balanceById = new Map(s.users.map((u) => [u.id, u.balance]));
+    const heldById = new Map();
+    for (const a of authorizations) {
+      if (a.status !== 'open' || Date.parse(a.expiresAt) <= importNow) continue;
+      heldById.set(a.fromUserId, (heldById.get(a.fromUserId) || 0) + (a.amount - a.capturedAmount));
+    }
+    for (const [uid, held] of heldById) {
+      if (held > balanceById.get(uid)) {
+        throw err(422, 'validation_failed', 'open holds exceed wallet total');
+      }
+    }
+  }
   if (s.authorizationTtlSeconds !== undefined) {
     if (!isIntegralNumber(s.authorizationTtlSeconds) || s.authorizationTtlSeconds < 1) {
       throw err(422, 'validation_failed', 'invalid authorization_ttl_seconds');
@@ -1097,6 +1112,10 @@ async function handleLogin(body) {
 }
 
 function withIdempotency(user, method, path, req, body, fn) {
+  // The body has been fully read by now and everything from here to the end
+  // of `fn` is synchronous, so take "now" and expire holds at the instant the
+  // state is judged and mutated -- not at the start of a possibly slow request.
+  sweepExpiredAuthorizations(Date.now());
   const key = validateIdempotencyKeyHeader(req);
   const { userMap, mapKey, existing } = resolveIdempotency(user, method, path, key, body);
   if (existing) {
@@ -1783,7 +1802,7 @@ server.on('clientError', (err_, socket) => {
 
 server.listen(PORT, '0.0.0.0', () => {
   // eslint-disable-next-line no-console
-  console.log(`pocketful stage-1 listening on 0.0.0.0:${PORT}`);
+  console.log(`pocketful stage-2 listening on 0.0.0.0:${PORT}`);
 });
 
 module.exports = { server, applyFixture };
