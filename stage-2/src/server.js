@@ -931,7 +931,7 @@ function validateImportSemantics(s) {
     if (!userIds.has(fromUserId) || !userIds.has(toUserId)) {
       throw err(422, 'validation_failed', 'authorization references unknown user');
     }
-    if (!isIntegralNumber(amount) || amount < 0 || amount > Number.MAX_SAFE_INTEGER) {
+    if (!isIntegralNumber(amount) || amount < 1 || amount > Number.MAX_SAFE_INTEGER) {
       throw err(422, 'validation_failed', 'invalid authorization amount');
     }
     if (!isIntegralNumber(capturedAmount) || capturedAmount < 0 || capturedAmount > amount) {

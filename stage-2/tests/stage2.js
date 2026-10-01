@@ -518,6 +518,7 @@ async function main() {
       (e) => { e.authorizations[0].fromUserId = 'u_nope'; },
       (e) => { e.authorizations[0].status = 'weird'; },
       (e) => { e.authorizations[0].capturedAmount = 99999; },
+      (e) => { e.authorizations[0].amount = 0; e.authorizations[0].capturedAmount = 0; },
       (e) => { e.authorizations[0].expiresAt = 'nope'; },
       (e) => { e.authorizations.push({ ...e.authorizations[0] }); },
       (e) => { e.authorizationTtlSeconds = -1; },
