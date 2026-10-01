@@ -113,6 +113,26 @@ function newIdempotencyKey() {
   return `key_${Date.now()}_${Math.random().toString(36).slice(2)}`;
 }
 
+// Minor units -> the plain decimal string a person would type ("20.00"),
+// using integer/string arithmetic only.
+function minorToDecimal(minor, minorUnits) {
+  if (minorUnits === 0) return String(minor);
+  const text = String(minor).padStart(minorUnits + 1, '0');
+  return `${text.slice(0, text.length - minorUnits)}.${text.slice(text.length - minorUnits)}`;
+}
+
+// Retry identity for one-click actions (request pay, capture): the same
+// action with the same body keeps one key until the outcome is confirmed
+// (success or a definite refusal), so a lost response is retried as a replay.
+const pendingKeys = new Map();
+function pendingKey(id) {
+  if (!pendingKeys.has(id)) pendingKeys.set(id, newIdempotencyKey());
+  return pendingKeys.get(id);
+}
+function settleKey(id) {
+  pendingKeys.delete(id);
+}
+
 // ---------------------------------------------------------------------------
 // Tiny DOM helpers
 // ---------------------------------------------------------------------------
@@ -135,6 +155,28 @@ function h(tag, attrs, children) {
 function clear(el) {
   while (el.firstChild) el.removeChild(el.firstChild);
 }
+
+// A labelled form field: the label is programmatically associated with its
+// control so screen readers and click-to-focus work.
+let fieldSeq = 0;
+function field(label, control) {
+  fieldSeq += 1;
+  const id = `f${fieldSeq}`;
+  control.setAttribute('id', id);
+  return h('div', { class: 'field' }, [h('label', { for: id }, [label]), control]);
+}
+
+// Status message. The icon is drawn by CSS (::before) so state is not conveyed
+// by colour alone while the element's text stays exactly the message.
+function message(kind, text, testid) {
+  return h('div', {
+    class: `msg ${kind}`,
+    role: kind === 'error' || kind === 'uncertain' ? 'alert' : 'status',
+    'data-testid': testid,
+  }, [text]);
+}
+
+const UNCERTAIN_TEXT = 'We could not confirm that this went through. Nothing has been lost: try again and it will only be applied once.';
 
 function humanTime(iso) {
   try {
@@ -201,27 +243,44 @@ window.addEventListener('popstate', render);
 // Root render
 // ---------------------------------------------------------------------------
 
+let renderSeq = 0;
 async function render() {
   const path = window.location.pathname;
   const app = document.getElementById('app');
-  clear(app);
 
-  const signedIn = !!getToken();
+  const mySeq = ++renderSeq;
+  let signedIn = !!getToken();
   if (!signedIn && path !== '/signup' && path !== '/login') {
-    if (path !== '/login') return navigate('/login', { replace: true });
+    return navigate('/login', { replace: true });
   }
-  if (signedIn && state.me === null) {
+  if (signedIn) {
+    // Re-read the wallet on every screen change so balances, available and
+    // held funds are never stale after a write made on another screen (or by
+    // another client).
     try {
-      state.me = await apiFetch('/me', { accept: 'application/json' });
+      const me = await apiFetch('/me', { accept: 'application/json' });
+      if (mySeq !== renderSeq) return;
+      state.me = me;
     } catch (e) {
-      // Token no longer valid: treat as signed out.
-      setToken(null);
-      state.me = null;
-      if (path !== '/signup' && path !== '/login') return navigate('/login', { replace: true });
+      if (mySeq !== renderSeq) return;
+      if (e instanceof ApiError && e.status === 401) {
+        // Token no longer valid: treat as signed out.
+        setToken(null);
+        state.me = null;
+        signedIn = false;
+        if (path !== '/signup' && path !== '/login') return navigate('/login', { replace: true });
+      } else if (state.me === null) {
+        // Network trouble with nothing cached: say so rather than signing out.
+        app.appendChild(h('main', {}, [h('div', { class: 'card' }, [
+          message('uncertain', 'Pocketful could not reach the server. Check your connection and try again.', 'load-error'),
+          h('button', { class: 'btn', onclick: () => render() }, ['Try again']),
+        ])]));
+        return;
+      }
     }
   }
+  clear(app);
 
-  const container = h('div', { class: 'page' }, []);
   app.appendChild(buildNav(path, signedIn));
   const main = h('main', {}, []);
   app.appendChild(main);
@@ -275,14 +334,14 @@ function renderSignup(main) {
 
   function renderError() {
     clear(errorSlot);
-    if (error) errorSlot.appendChild(h('div', { class: 'msg error', 'data-testid': 'auth-error' }, [error]));
+    if (error) errorSlot.appendChild(message('error', error, 'auth-error'));
   }
 
   const form = h('div', { class: 'card' }, [
     h('h2', {}, ['Create your account']),
-    h('div', { class: 'field' }, [h('label', {}, ['Email']), emailField]),
-    h('div', { class: 'field' }, [h('label', {}, ['Password']), passwordField]),
-    h('div', { class: 'field' }, [h('label', {}, ['Display name']), nameField]),
+    field('Email', emailField),
+    field('Password', passwordField),
+    field('Display name', nameField),
     errorSlot,
     h('button', {
       class: 'btn',
@@ -316,13 +375,13 @@ function renderLogin(main) {
 
   function renderError() {
     clear(errorSlot);
-    if (error) errorSlot.appendChild(h('div', { class: 'msg error', 'data-testid': 'auth-error' }, [error]));
+    if (error) errorSlot.appendChild(message('error', error, 'auth-error'));
   }
 
   const form = h('div', { class: 'card' }, [
     h('h2', {}, ['Log in']),
-    h('div', { class: 'field' }, [h('label', {}, ['Email']), emailField]),
-    h('div', { class: 'field' }, [h('label', {}, ['Password']), passwordField]),
+    field('Email', emailField),
+    field('Password', passwordField),
     errorSlot,
     h('button', {
       class: 'btn',
@@ -348,121 +407,132 @@ function renderLogin(main) {
   main.appendChild(form);
 }
 
+
+// ---------------------------------------------------------------------------
+// Shared screen helpers
+// ---------------------------------------------------------------------------
+
+function moneyOf(minor) {
+  return formatMoney(minor, state.me.minor_units, state.me.currency);
+}
+
+function loadingBlock(text) {
+  return h('div', { class: 'loading-text', role: 'status' }, [text || 'Loading…']);
+}
+
+// Runs an async click handler with a re-entrancy guard: while one submission
+// is in flight, further clicks on the same button are ignored (the button is
+// also visibly disabled), then it is re-enabled whatever the outcome.
+function guarded(button, fn) {
+  let busy = false;
+  button.addEventListener('click', async () => {
+    if (busy) return;
+    busy = true;
+    button.setAttribute('disabled', 'disabled');
+    button.setAttribute('aria-busy', 'true');
+    try {
+      await fn();
+    } finally {
+      busy = false;
+      button.removeAttribute('disabled');
+      button.removeAttribute('aria-busy');
+    }
+  });
+  return button;
+}
+
+// A message slot: show(kind, text, testid) replaces the current message;
+// show(null) empties it.
+function messageSlot() {
+  const el = h('div', { class: 'msg-slot' }, []);
+  el.show = (kind, text, testid) => {
+    clear(el);
+    if (kind) el.appendChild(message(kind, text, testid));
+  };
+  return el;
+}
+
+function directionTag(p) {
+  const sent = p.from_user_id === state.me.user_id;
+  return h('span', { class: `direction-tag ${sent ? 'sent' : 'received'}` }, [sent ? 'Sent' : 'Received']);
+}
+
+// The authorize form is shown on both / and /authorizations; `onDone` lets the
+// host screen refresh whatever it displays after a successful hold.
+function buildAuthorizeForm(onDone) {
+  const handle = h('input', { type: 'text', autocomplete: 'off', 'data-testid': 'authorize-handle' });
+  const amount = h('input', { type: 'text', inputmode: 'decimal', autocomplete: 'off', 'data-testid': 'authorize-amount' });
+  const note = h('input', { type: 'text', autocomplete: 'off', 'data-testid': 'authorize-note' });
+  const visibility = h('select', { 'data-testid': 'authorize-visibility' }, [
+    h('option', { value: 'public' }, ['Public']),
+    h('option', { value: 'private' }, ['Private']),
+  ]);
+  const slot = messageSlot();
+  const submit = h('button', { class: 'btn', 'data-testid': 'authorize-submit' }, ['Place hold']);
+  guarded(submit, async () => {
+    const amt = parseAmount(amount.value, state.me.minor_units);
+    if (amt === null) {
+      slot.show('error', 'Enter a valid amount, for example 15.00.', 'authorize-error');
+      return;
+    }
+    const body = { to_handle: handle.value.trim(), amount: amt, note: note.value, visibility: visibility.value };
+    const key = keyFor('authorize', formSignature(body));
+    try {
+      await apiFetch('/authorizations', { method: 'POST', key, body });
+      slot.show('success', `Hold placed: ${moneyOf(amt)} is reserved for ${body.to_handle}.`, 'authorize-success');
+    } catch (e) {
+      if (e instanceof UncertainError) slot.show('uncertain', UNCERTAIN_TEXT, 'authorize-uncertain');
+      else slot.show('error', e.message, 'authorize-error');
+      return;
+    }
+    await onDone();
+  });
+  return h('section', { class: 'card', 'aria-labelledby': 'authorize-title' }, [
+    h('h2', { id: 'authorize-title' }, ['Hold money for someone']),
+    h('p', { class: 'hint' }, ['A hold reserves funds without sending them. The recipient can collect it later, or it is released when it expires.']),
+    field('To handle', handle),
+    field('Amount', amount),
+    field('Note (optional)', note),
+    field('Visibility', visibility),
+    slot,
+    submit,
+  ]);
+}
+
 // ---------------------------------------------------------------------------
 // Home: balance, pay form, request form, activity feed
 // ---------------------------------------------------------------------------
 
 async function renderHome(main) {
-  const money = (minor) => formatMoney(minor, state.me.minor_units, state.me.currency);
-
-  const balanceHeadline = h('div', { class: 'balance-headline', 'data-testid': 'wallet-available', 'data-amount': String(state.me.available) }, [money(state.me.available)]);
-  const balanceSub = h('div', { class: 'balance-sub' }, [
-    h('span', {}, ['Total: ', h('strong', { 'data-testid': 'wallet-balance', 'data-amount': String(state.me.total) }, [money(state.me.total)])]),
-  ]);
-  if (state.me.held > 0) {
-    balanceSub.appendChild(h('span', {}, ['Held: ', h('strong', { 'data-testid': 'wallet-held', 'data-amount': String(state.me.held) }, [money(state.me.held)])]));
-  }
+  const headline = h('div', { class: 'balance-headline', 'data-testid': 'wallet-available' }, []);
+  const sub = h('div', { class: 'balance-sub' }, []);
   const refreshBtn = h('button', { class: 'btn secondary small', 'data-testid': 'wallet-refresh' }, ['Refresh']);
-  const balanceCard = h('div', { class: 'card balance-block' }, [
-    h('div', { style: 'display:flex;justify-content:space-between;align-items:flex-start;' }, [
-      h('div', {}, [h('div', { class: 'loading-text' }, ['Available to spend']), balanceHeadline]),
+
+  function paintBalance() {
+    const me = state.me;
+    headline.textContent = moneyOf(me.available);
+    headline.setAttribute('data-amount', String(me.available));
+    clear(sub);
+    sub.appendChild(h('span', {}, ['Total ', h('strong', { 'data-testid': 'wallet-balance', 'data-amount': String(me.total) }, [moneyOf(me.total)])]));
+    if (me.held > 0) {
+      sub.appendChild(h('span', { class: 'held' }, ['On hold ', h('strong', { 'data-testid': 'wallet-held', 'data-amount': String(me.held) }, [moneyOf(me.held)])]));
+    }
+  }
+  paintBalance();
+
+  const balanceCard = h('section', { class: 'card balance-block', 'aria-label': 'Wallet' }, [
+    h('div', { class: 'balance-row' }, [
+      h('div', {}, [h('div', { class: 'balance-label' }, ['Available to spend']), headline]),
       refreshBtn,
     ]),
-    balanceSub,
+    sub,
   ]);
 
-  // Pay form ---------------------------------------------------------------
-  const payHandle = h('input', { type: 'text', 'data-testid': 'pay-handle' });
-  const payAmount = h('input', { type: 'text', 'data-testid': 'pay-amount' });
-  const payNote = h('input', { type: 'text', 'data-testid': 'pay-note' });
-  const payVisibility = h('select', { 'data-testid': 'pay-visibility' }, [
-    h('option', { value: 'public' }, ['Public']),
-    h('option', { value: 'private' }, ['Private']),
-  ]);
-  const payMsgSlot = h('div', {});
+  const activitySlot = h('div', {}, [h('section', { class: 'card' }, [h('h2', {}, ['Activity']), loadingBlock('Loading activity…')])]);
 
-  function renderPayMsg(kind, text) {
-    clear(payMsgSlot);
-    if (!kind) return;
-    const testid = kind === 'error' ? 'pay-error' : 'pay-uncertain';
-    payMsgSlot.appendChild(h('div', { class: `msg ${kind}`, 'data-testid': testid }, [text]));
-  }
-
-  async function submitPay() {
-    const amt = parseAmount(payAmount.value, state.me.minor_units);
-    if (amt === null) {
-      renderPayMsg('error', 'Enter a valid amount.');
-      return;
-    }
-    const signature = formSignature({ handle: payHandle.value, amount: amt, note: payNote.value, visibility: payVisibility.value });
-    const key = keyFor('pay', signature);
-    try {
-      await apiFetch('/payments', {
-        method: 'POST',
-        key,
-        body: { to_handle: payHandle.value, amount: amt, note: payNote.value, visibility: payVisibility.value },
-      });
-      renderPayMsg(null);
-      await refreshWalletAndFeed();
-    } catch (e) {
-      if (e instanceof UncertainError) {
-        renderPayMsg('uncertain', 'We could not confirm this payment. It is safe to try again.');
-      } else {
-        renderPayMsg('error', e.message);
-        await refreshWalletAndFeed();
-      }
-    }
-  }
-
-  const payForm = h('div', { class: 'card' }, [
-    h('h2', {}, ['Send money']),
-    h('div', { class: 'field' }, [h('label', {}, ['To handle']), payHandle]),
-    h('div', { class: 'field' }, [h('label', {}, ['Amount']), payAmount]),
-    h('div', { class: 'field' }, [h('label', {}, ['Note (optional)']), payNote]),
-    h('div', { class: 'field' }, [h('label', {}, ['Visibility']), payVisibility]),
-    payMsgSlot,
-    h('button', { class: 'btn', 'data-testid': 'pay-submit', onclick: submitPay }, ['Pay']),
-  ]);
-
-  // Request form ------------------------------------------------------------
-  const reqHandle = h('input', { type: 'text', 'data-testid': 'request-handle' });
-  const reqAmount = h('input', { type: 'text', 'data-testid': 'request-amount' });
-  const reqNote = h('input', { type: 'text', 'data-testid': 'request-note' });
-  const reqMsgSlot = h('div', {});
-
-  function renderReqMsg(text) {
-    clear(reqMsgSlot);
-    if (text) reqMsgSlot.appendChild(h('div', { class: 'msg error', 'data-testid': 'request-error' }, [text]));
-  }
-
-  async function submitRequest() {
-    const amt = parseAmount(reqAmount.value, state.me.minor_units);
-    if (amt === null) {
-      renderReqMsg('Enter a valid amount.');
-      return;
-    }
-    const signature = formSignature({ handle: reqHandle.value, amount: amt, note: reqNote.value });
-    const key = keyFor('request', signature);
-    try {
-      await apiFetch('/requests', { method: 'POST', key, body: { payer_handle: reqHandle.value, amount: amt, note: reqNote.value } });
-      renderReqMsg(null);
-      await refreshWalletAndFeed();
-    } catch (e) {
-      if (!(e instanceof UncertainError)) renderReqMsg(e.message);
-    }
-  }
-
-  const requestForm = h('div', { class: 'card' }, [
-    h('h2', {}, ['Request money']),
-    h('div', { class: 'field' }, [h('label', {}, ['From handle']), reqHandle]),
-    h('div', { class: 'field' }, [h('label', {}, ['Amount']), reqAmount]),
-    h('div', { class: 'field' }, [h('label', {}, ['Note (optional)']), reqNote]),
-    reqMsgSlot,
-    h('button', { class: 'btn', 'data-testid': 'request-submit', onclick: submitRequest }, ['Request']),
-  ]);
-
-  const activitySlot = h('div', {});
-
+  // Latest refresh wins: every refresh takes a sequence number and only the
+  // highest one issued so far may write to the page, so a slow earlier
+  // response can never overwrite a later one.
   async function refreshWalletAndFeed() {
     const mySeq = ++state.refreshSeq;
     try {
@@ -470,47 +540,119 @@ async function renderHome(main) {
         apiFetch('/me', { accept: 'application/json' }),
         apiFetch('/activity', { accept: 'application/json' }),
       ]);
-      // Out-of-order guard: only the latest-issued refresh may write to the DOM.
       if (mySeq !== state.refreshSeq) return;
       state.me = me;
-      renderBalanceInPlace(balanceHeadline, balanceSub, money2(me));
+      paintBalance();
       renderActivity(activitySlot, activity.payments || []);
     } catch (e) {
-      // A failed background refresh is not user-actionable here; leave the
-      // last known-good state on screen.
+      if (mySeq !== state.refreshSeq) return;
+      // Keep the last known-good numbers on screen and say the refresh failed.
+      if (!activitySlot.querySelector('[data-testid="activity-list"], [data-testid="empty-activity"]')) {
+        clear(activitySlot);
+        activitySlot.appendChild(h('section', { class: 'card' }, [h('h2', {}, ['Activity']), message('error', 'Activity could not be loaded.', 'activity-error')]));
+      }
     }
   }
-
-  function money2(me) {
-    return (minor) => formatMoney(minor, me.minor_units, me.currency);
-  }
-
+  // Deliberately NOT guarded: a second click while an earlier refresh is in
+  // flight must issue a new read that supersedes it.
   refreshBtn.addEventListener('click', refreshWalletAndFeed);
 
+  // Pay form ---------------------------------------------------------------
+  const payHandle = h('input', { type: 'text', autocomplete: 'off', 'data-testid': 'pay-handle' });
+  const payAmount = h('input', { type: 'text', inputmode: 'decimal', autocomplete: 'off', 'data-testid': 'pay-amount' });
+  const payNote = h('input', { type: 'text', autocomplete: 'off', 'data-testid': 'pay-note' });
+  const payVisibility = h('select', { 'data-testid': 'pay-visibility' }, [
+    h('option', { value: 'public' }, ['Public']),
+    h('option', { value: 'private' }, ['Private']),
+  ]);
+  const payMsg = messageSlot();
+  const paySubmit = h('button', { class: 'btn', 'data-testid': 'pay-submit' }, ['Pay']);
+  guarded(paySubmit, async () => {
+    const amt = parseAmount(payAmount.value, state.me.minor_units);
+    if (amt === null) {
+      payMsg.show('error', 'Enter a valid amount, for example 15.00.', 'pay-error');
+      return;
+    }
+    const body = { to_handle: payHandle.value.trim(), amount: amt, note: payNote.value, visibility: payVisibility.value };
+    // Same content -> same key (an unchanged resubmit is a replay); any change
+    // to a field mints a new key.
+    const key = keyFor('pay', formSignature(body));
+    try {
+      await apiFetch('/payments', { method: 'POST', key, body });
+      payMsg.show('success', `Sent ${moneyOf(amt)} to ${body.to_handle}.`, 'pay-success');
+    } catch (e) {
+      if (e instanceof UncertainError) {
+        // Unknown outcome: not a refusal. The form stays as it is so Pay
+        // retries with the same key and body.
+        payMsg.show('uncertain', UNCERTAIN_TEXT, 'pay-uncertain');
+        return;
+      }
+      payMsg.show('error', e.message, 'pay-error');
+    }
+    await refreshWalletAndFeed();
+  });
+
+  const payForm = h('section', { class: 'card', 'aria-labelledby': 'pay-title' }, [
+    h('h2', { id: 'pay-title' }, ['Send money']),
+    field('To handle', payHandle),
+    field('Amount', payAmount),
+    field('Note (optional)', payNote),
+    field('Visibility', payVisibility),
+    payMsg,
+    paySubmit,
+  ]);
+
+  // Request form ------------------------------------------------------------
+  const reqHandle = h('input', { type: 'text', autocomplete: 'off', 'data-testid': 'request-handle' });
+  const reqAmount = h('input', { type: 'text', inputmode: 'decimal', autocomplete: 'off', 'data-testid': 'request-amount' });
+  const reqNote = h('input', { type: 'text', autocomplete: 'off', 'data-testid': 'request-note' });
+  const reqMsg = messageSlot();
+  const reqSubmit = h('button', { class: 'btn', 'data-testid': 'request-submit' }, ['Request']);
+  guarded(reqSubmit, async () => {
+    const amt = parseAmount(reqAmount.value, state.me.minor_units);
+    if (amt === null) {
+      reqMsg.show('error', 'Enter a valid amount, for example 15.00.', 'request-error');
+      return;
+    }
+    const body = { payer_handle: reqHandle.value.trim(), amount: amt, note: reqNote.value };
+    const key = keyFor('request', formSignature(body));
+    try {
+      await apiFetch('/requests', { method: 'POST', key, body });
+      reqMsg.show('success', `Requested ${moneyOf(amt)} from ${body.payer_handle}.`, 'request-success');
+    } catch (e) {
+      if (e instanceof UncertainError) reqMsg.show('uncertain', UNCERTAIN_TEXT, 'request-uncertain');
+      else reqMsg.show('error', e.message, 'request-error');
+    }
+  });
+
+  const requestForm = h('section', { class: 'card', 'aria-labelledby': 'request-title' }, [
+    h('h2', { id: 'request-title' }, ['Request money']),
+    field('From handle', reqHandle),
+    field('Amount', reqAmount),
+    field('Note (optional)', reqNote),
+    reqMsg,
+    reqSubmit,
+  ]);
+
+  main.appendChild(balanceCard);
   main.appendChild(h('div', { class: 'two-col' }, [payForm, requestForm]));
-  main.insertBefore(balanceCard, main.firstChild);
+  main.appendChild(buildAuthorizeForm(refreshWalletAndFeed));
   main.appendChild(activitySlot);
 
-  const activity = await apiFetch('/activity', { accept: 'application/json' });
-  renderActivity(activitySlot, activity.payments || []);
-}
-
-function renderBalanceInPlace(headlineEl, subEl, money) {
-  headlineEl.textContent = money(state.me.available);
-  headlineEl.setAttribute('data-amount', String(state.me.available));
-  clear(subEl);
-  subEl.appendChild(h('span', {}, ['Total: ', h('strong', { 'data-testid': 'wallet-balance', 'data-amount': String(state.me.total) }, [money(state.me.total)])]));
-  if (state.me.held > 0) {
-    subEl.appendChild(h('span', {}, ['Held: ', h('strong', { 'data-testid': 'wallet-held', 'data-amount': String(state.me.held) }, [money(state.me.held)])]));
+  try {
+    const activity = await apiFetch('/activity', { accept: 'application/json' });
+    renderActivity(activitySlot, activity.payments || []);
+  } catch (e) {
+    clear(activitySlot);
+    activitySlot.appendChild(h('section', { class: 'card' }, [h('h2', {}, ['Activity']), message('error', 'Activity could not be loaded.', 'activity-error')]));
   }
 }
 
 function renderActivity(slot, payments) {
   clear(slot);
-  const money = (minor) => formatMoney(minor, state.me.minor_units, state.me.currency);
-  const card = h('div', { class: 'card' }, [h('h2', {}, ['Activity'])]);
+  const card = h('section', { class: 'card' }, [h('h2', {}, ['Activity'])]);
   if (payments.length === 0) {
-    card.appendChild(h('div', { class: 'empty-state', 'data-testid': 'empty-activity' }, ['No activity yet.']));
+    card.appendChild(h('div', { class: 'empty-state', 'data-testid': 'empty-activity' }, ['No activity yet. Payments you send or receive will show up here.']));
   } else {
     const sorted = [...payments].sort((a, b) => (a.created_at < b.created_at ? 1 : a.created_at > b.created_at ? -1 : 0));
     const list = h('ul', { class: 'list', 'data-testid': 'activity-list' }, sorted.map((p) => h('li', {
@@ -519,11 +661,14 @@ function renderActivity(slot, payments) {
       'data-visibility': p.visibility,
     }, [
       h('div', { class: 'list-item-main' }, [
-        h('span', { class: 'list-item-parties', 'data-testid': `activity-parties-${p.payment_id}` }, [`${p.from_handle} \u2192 ${p.to_handle}`]),
-        h('span', { class: 'list-item-meta' }, [humanTime(p.created_at), ' \u00b7 ', h('span', { class: 'visibility-tag' }, [p.visibility])]),
-        h('span', { class: 'list-item-meta', 'data-testid': `activity-note-${p.payment_id}` }, [p.note || '']),
+        h('span', { class: 'list-item-parties' }, [
+          directionTag(p),
+          h('span', { 'data-testid': `activity-parties-${p.payment_id}` }, [`${p.from_handle} → ${p.to_handle}`]),
+        ]),
+        h('span', { class: 'list-item-meta' }, [humanTime(p.created_at), ' · ', h('span', { class: 'visibility-tag' }, [p.visibility === 'private' ? '\u{1F512} private' : 'public'])]),
+        h('span', { class: 'list-item-note', 'data-testid': `activity-note-${p.payment_id}` }, [p.note || '']),
       ]),
-      h('span', { class: 'list-item-amount', 'data-testid': `activity-amount-${p.payment_id}` }, [money(p.amount)]),
+      h('span', { class: 'list-item-amount', 'data-testid': `activity-amount-${p.payment_id}` }, [moneyOf(p.amount)]),
     ])));
     card.appendChild(list);
   }
@@ -535,24 +680,13 @@ function renderActivity(slot, payments) {
 // ---------------------------------------------------------------------------
 
 async function renderRequests(main) {
-  const errorSlot = h('div', {});
+  const msg = messageSlot();
   const incomingList = h('ul', { class: 'list', 'data-testid': 'incoming-list' }, []);
   const outgoingList = h('ul', { class: 'list', 'data-testid': 'outgoing-list' }, []);
   const emptySlot = h('div', {});
-
-  function money(minor) {
-    return formatMoney(minor, state.me.minor_units, state.me.currency);
-  }
-
-  function renderError(text) {
-    clear(errorSlot);
-    if (text) errorSlot.appendChild(h('div', { class: 'msg error', 'data-testid': 'request-error' }, [text]));
-  }
+  const loadingSlot = loadingBlock('Loading requests…');
 
   async function load() {
-    clear(incomingList);
-    clear(outgoingList);
-    clear(emptySlot);
     let incoming = [];
     let outgoing = [];
     try {
@@ -563,78 +697,67 @@ async function renderRequests(main) {
       incoming = inc.requests || [];
       outgoing = out.requests || [];
     } catch (e) {
-      renderError(e.message);
+      loadingSlot.remove();
+      msg.show('error', 'Requests could not be loaded. ' + (e.message || ''), 'request-error');
       return;
     }
+    loadingSlot.remove();
+    clear(incomingList);
+    clear(outgoingList);
+    clear(emptySlot);
     if (incoming.length === 0 && outgoing.length === 0) {
-      emptySlot.appendChild(h('div', { class: 'empty-state', 'data-testid': 'empty-requests' }, ['No requests yet.']));
+      emptySlot.appendChild(h('div', { class: 'empty-state', 'data-testid': 'empty-requests' }, ['No requests yet. Requests you send or receive will show up here.']));
     }
     for (const r of incoming) incomingList.appendChild(requestItem(r, 'incoming'));
     for (const r of outgoing) outgoingList.appendChild(requestItem(r, 'outgoing'));
   }
 
+  // One-click action with a definite outcome handling: success and refusals
+  // re-read the list (so stale buttons disappear); a lost response is shown as
+  // unknown, keeps its retry key, and also re-reads the list.
+  function act(button, path, withKey, okText) {
+    guarded(button, async () => {
+      const keyId = `req:${path}`;
+      try {
+        await apiFetch(path, { method: 'POST', ...(withKey ? { key: pendingKey(keyId), body: {} } : {}) });
+        settleKey(keyId);
+        msg.show('success', okText);
+      } catch (e) {
+        if (e instanceof UncertainError) {
+          msg.show('uncertain', UNCERTAIN_TEXT, 'request-uncertain');
+          return;
+        }
+        settleKey(keyId);
+        msg.show('error', e.message, 'request-error');
+      }
+      await load();
+    });
+    return button;
+  }
+
   function requestItem(r, direction) {
     const actions = [];
     if (r.status === 'pending' && direction === 'incoming') {
-      actions.push(h('button', {
-        class: 'btn small',
-        'data-testid': `request-pay-${r.request_id}`,
-        onclick: async () => {
-          try {
-            await apiFetch(`/requests/${r.request_id}/pay`, { method: 'POST', key: newIdempotencyKey(), body: {} });
-            renderError(null);
-            await load();
-          } catch (e) {
-            renderError(e.message);
-            await load();
-          }
-        },
-      }, ['Pay']));
-      actions.push(h('button', {
-        class: 'btn secondary small',
-        'data-testid': `request-decline-${r.request_id}`,
-        onclick: async () => {
-          try {
-            await apiFetch(`/requests/${r.request_id}/decline`, { method: 'POST' });
-            renderError(null);
-            await load();
-          } catch (e) {
-            renderError(e.message);
-            await load();
-          }
-        },
-      }, ['Decline']));
+      actions.push(act(h('button', { class: 'btn small', 'data-testid': `request-pay-${r.request_id}` }, ['Pay']), `/requests/${r.request_id}/pay`, true, `Paid ${moneyOf(r.amount)} to ${r.requester_handle}.`));
+      actions.push(act(h('button', { class: 'btn secondary small', 'data-testid': `request-decline-${r.request_id}` }, ['Decline']), `/requests/${r.request_id}/decline`, false, 'Request declined.'));
     }
     if (r.status === 'pending' && direction === 'outgoing') {
-      actions.push(h('button', {
-        class: 'btn secondary small',
-        'data-testid': `request-cancel-${r.request_id}`,
-        onclick: async () => {
-          try {
-            await apiFetch(`/requests/${r.request_id}/cancel`, { method: 'POST' });
-            renderError(null);
-            await load();
-          } catch (e) {
-            renderError(e.message);
-            await load();
-          }
-        },
-      }, ['Cancel']));
+      actions.push(act(h('button', { class: 'btn secondary small', 'data-testid': `request-cancel-${r.request_id}` }, ['Cancel']), `/requests/${r.request_id}/cancel`, false, 'Request cancelled.'));
     }
-    const who = direction === 'incoming' ? r.requester_handle : r.payer_handle;
+    const who = direction === 'incoming' ? `${r.requester_handle} asked you` : `You asked ${r.payer_handle}`;
     return h('li', { class: 'list-item', 'data-testid': `request-item-${r.request_id}`, 'data-status': r.status }, [
       h('div', { class: 'list-item-main' }, [
-        h('span', { class: 'list-item-parties' }, [who]),
-        h('span', { class: `status-pill ${r.status}` }, [r.status]),
-        h('span', { class: 'list-item-meta' }, [r.note || '']),
+        h('span', { class: 'list-item-parties' }, [who, h('span', { class: `status-pill ${r.status}` }, [r.status])]),
+        h('span', { class: 'list-item-meta' }, [humanTime(r.created_at)]),
+        h('span', { class: 'list-item-note' }, [r.note || '']),
       ]),
-      h('span', { class: 'list-item-amount', 'data-testid': `request-amount-${r.request_id}` }, [money(r.amount)]),
+      h('span', { class: 'list-item-amount', 'data-testid': `request-amount-${r.request_id}` }, [moneyOf(r.amount)]),
       h('div', { class: 'list-item-actions' }, actions),
     ]);
   }
 
-  main.appendChild(h('div', { class: 'card' }, [h('h2', {}, ['Incoming requests']), errorSlot, incomingList]));
-  main.appendChild(h('div', { class: 'card' }, [h('h2', {}, ['Outgoing requests']), outgoingList]));
+  main.appendChild(h('section', { class: 'card' }, [h('h2', {}, ['Requests to you']), msg, loadingSlot, incomingList]));
+  main.appendChild(h('section', { class: 'card' }, [h('h2', {}, ['Requests you sent']), outgoingList]));
   main.appendChild(emptySlot);
   await load();
 }
@@ -643,6 +766,8 @@ async function renderRequests(main) {
 // Split screen
 // ---------------------------------------------------------------------------
 
+// Stage 1 section 9: whole minor units, sum exactly to the amount, larger
+// shares to the first participants in the order given.
 function equalSplit(amount, n) {
   const base = Math.floor(amount / n);
   const remainder = amount - base * n;
@@ -652,62 +777,58 @@ function equalSplit(amount, n) {
 }
 
 function renderSplit(main) {
-  const amountField = h('input', { type: 'text', 'data-testid': 'split-amount' });
-  const handlesField = h('input', { type: 'text', 'data-testid': 'split-handles' });
-  const noteField = h('input', { type: 'text', 'data-testid': 'split-note' });
+  const amountField = h('input', { type: 'text', inputmode: 'decimal', autocomplete: 'off', 'data-testid': 'split-amount' });
+  const handlesField = h('input', { type: 'text', autocomplete: 'off', placeholder: 'ada, bob, cy', 'data-testid': 'split-handles' });
+  const noteField = h('input', { type: 'text', autocomplete: 'off', 'data-testid': 'split-note' });
   const previewSlot = h('div', {});
-  const errorSlot = h('div', {});
+  const msg = messageSlot();
 
-  function money(minor) {
-    return formatMoney(minor, state.me.minor_units, state.me.currency);
-  }
-
-  function renderError(text) {
-    clear(errorSlot);
-    if (text) errorSlot.appendChild(h('div', { class: 'msg error', 'data-testid': 'split-error' }, [text]));
-  }
+  const parseHandles = () => handlesField.value.split(',').map((s) => s.trim()).filter(Boolean);
 
   function updatePreview() {
     clear(previewSlot);
     const amt = parseAmount(amountField.value, state.me.minor_units);
-    const handles = handlesField.value.split(',').map((s) => s.trim()).filter(Boolean);
+    const handles = parseHandles();
     if (amt === null || handles.length === 0) return;
     const shares = equalSplit(amt, handles.length);
     const rows = handles.map((hd, i) => h('div', { class: 'split-share-row' }, [
       h('span', {}, [hd]),
-      h('span', { 'data-testid': `split-share-${hd}` }, [money(shares[i])]),
+      h('span', { 'data-testid': `split-share-${hd}` }, [moneyOf(shares[i])]),
     ]));
-    previewSlot.appendChild(h('div', { class: 'split-shares', 'data-testid': 'split-preview' }, rows));
+    previewSlot.appendChild(h('div', { class: 'split-shares', 'data-testid': 'split-preview' }, [h('div', { class: 'split-shares-title' }, ['Each person’s share']), ...rows]));
   }
-
   amountField.addEventListener('input', updatePreview);
   handlesField.addEventListener('input', updatePreview);
 
-  async function submitSplit() {
+  const submit = h('button', { class: 'btn', 'data-testid': 'split-submit' }, ['Split']);
+  guarded(submit, async () => {
     const amt = parseAmount(amountField.value, state.me.minor_units);
-    const handles = handlesField.value.split(',').map((s) => s.trim()).filter(Boolean);
+    const handles = parseHandles();
     if (amt === null || handles.length === 0) {
-      renderError('Enter a valid amount and at least one handle.');
+      msg.show('error', 'Enter a valid amount and at least one handle.', 'split-error');
       return;
     }
-    const signature = formSignature({ amount: amt, handles, note: noteField.value });
-    const key = keyFor('split', signature);
+    const body = { amount: amt, participant_handles: handles, note: noteField.value };
+    const key = keyFor('split', formSignature(body));
     try {
-      await apiFetch('/splits', { method: 'POST', key, body: { amount: amt, participant_handles: handles, note: noteField.value } });
-      renderError(null);
+      const res = await apiFetch('/splits', { method: 'POST', key, body });
+      const n = (res.requests || []).length;
+      msg.show('success', `Split created: ${n} request${n === 1 ? '' : 's'} sent.`, 'split-success');
     } catch (e) {
-      if (!(e instanceof UncertainError)) renderError(e.message);
+      if (e instanceof UncertainError) msg.show('uncertain', UNCERTAIN_TEXT, 'split-uncertain');
+      else msg.show('error', e.message, 'split-error');
     }
-  }
+  });
 
-  main.appendChild(h('div', { class: 'card' }, [
-    h('h2', {}, ['Split a bill']),
-    h('div', { class: 'field' }, [h('label', {}, ['Amount']), amountField]),
-    h('div', { class: 'field' }, [h('label', {}, ['Handles (comma separated)']), handlesField]),
-    h('div', { class: 'field' }, [h('label', {}, ['Note (optional)']), noteField]),
+  main.appendChild(h('section', { class: 'card', 'aria-labelledby': 'split-title' }, [
+    h('h2', { id: 'split-title' }, ['Split a bill']),
+    h('p', { class: 'hint' }, ['You paid; everyone else gets a request for their share. Include yourself to see your own share.']),
+    field('Total amount', amountField),
+    field('Handles (comma separated)', handlesField),
+    field('Note (optional)', noteField),
     previewSlot,
-    errorSlot,
-    h('button', { class: 'btn', 'data-testid': 'split-submit', onclick: submitSplit }, ['Split']),
+    msg,
+    submit,
   ]));
 }
 
@@ -716,152 +837,121 @@ function renderSplit(main) {
 // ---------------------------------------------------------------------------
 
 async function renderAuthorizations(main) {
-  function money(minor) {
-    return formatMoney(minor, state.me.minor_units, state.me.currency);
-  }
-
-  const errorSlot = h('div', {});
-  function renderError(text) {
-    clear(errorSlot);
-    if (text) errorSlot.appendChild(h('div', { class: 'msg error', 'data-testid': 'authorization-error' }, [text]));
-  }
-
-  // Authorize form -----------------------------------------------------------
-  const authHandle = h('input', { type: 'text', 'data-testid': 'authorize-handle' });
-  const authAmount = h('input', { type: 'text', 'data-testid': 'authorize-amount' });
-  const authNote = h('input', { type: 'text', 'data-testid': 'authorize-note' });
-  const authVisibility = h('select', { 'data-testid': 'authorize-visibility' }, [
-    h('option', { value: 'public' }, ['Public']),
-    h('option', { value: 'private' }, ['Private']),
-  ]);
-  const authErrorSlot = h('div', {});
-  function renderAuthError(text) {
-    clear(authErrorSlot);
-    if (text) authErrorSlot.appendChild(h('div', { class: 'msg error', 'data-testid': 'authorize-error' }, [text]));
-  }
-
-  async function submitAuthorize() {
-    const amt = parseAmount(authAmount.value, state.me.minor_units);
-    if (amt === null) {
-      renderAuthError('Enter a valid amount.');
-      return;
-    }
-    const signature = formSignature({ handle: authHandle.value, amount: amt, note: authNote.value, visibility: authVisibility.value });
-    const key = keyFor('authorize', signature);
-    try {
-      await apiFetch('/authorizations', {
-        method: 'POST',
-        key,
-        body: { to_handle: authHandle.value, amount: amt, note: authNote.value, visibility: authVisibility.value },
-      });
-      renderAuthError(null);
-      await load();
-    } catch (e) {
-      if (!(e instanceof UncertainError)) renderAuthError(e.message);
-    }
-  }
-
-  const authorizeForm = h('div', { class: 'card' }, [
-    h('h2', {}, ['Authorize a hold']),
-    h('div', { class: 'field' }, [h('label', {}, ['To handle']), authHandle]),
-    h('div', { class: 'field' }, [h('label', {}, ['Amount']), authAmount]),
-    h('div', { class: 'field' }, [h('label', {}, ['Note (optional)']), authNote]),
-    h('div', { class: 'field' }, [h('label', {}, ['Visibility']), authVisibility]),
-    authErrorSlot,
-    h('button', { class: 'btn', 'data-testid': 'authorize-submit', onclick: submitAuthorize }, ['Authorize']),
-  ]);
-
+  const msg = messageSlot();
   const listSlot = h('ul', { class: 'list', 'data-testid': 'authorization-list' }, []);
   const emptySlot = h('div', {});
+  const loadingSlot = loadingBlock('Loading authorizations…');
 
   async function load() {
-    clear(listSlot);
-    clear(emptySlot);
     let items = [];
     try {
       const result = await apiFetch('/authorizations', { accept: 'application/json' });
       items = result.authorizations || [];
     } catch (e) {
-      renderError(e.message);
+      loadingSlot.remove();
+      msg.show('error', 'Authorizations could not be loaded. ' + (e.message || ''), 'authorization-error');
       return;
     }
+    loadingSlot.remove();
+    clear(listSlot);
+    clear(emptySlot);
     if (items.length === 0) {
-      emptySlot.appendChild(h('div', { class: 'empty-state', 'data-testid': 'empty-authorizations' }, ['No authorizations yet.']));
+      emptySlot.appendChild(h('div', { class: 'empty-state', 'data-testid': 'empty-authorizations' }, ['No holds yet. Holds you place or receive will show up here.']));
       return;
     }
     for (const a of items) listSlot.appendChild(authorizationItem(a));
   }
 
   function authorizationItem(a) {
+    const id = a.authorization_id;
     const isIncoming = a.to_handle === state.me.handle;
     const isOutgoing = a.from_handle === state.me.handle;
-    const children = [
-      h('div', { class: 'list-item-main' }, [
-        h('span', { class: 'list-item-parties' }, [`${a.from_handle} \u2192 ${a.to_handle}`]),
+    const main = [
+      h('span', { class: 'list-item-parties' }, [
+        `${a.from_handle} → ${a.to_handle}`,
         h('span', { class: `status-pill ${a.status}` }, [a.status]),
-        h('span', { class: 'list-item-meta', 'data-testid': `authorization-expires-${a.authorization_id}` }, [a.expires_at]),
       ]),
-      h('span', { class: 'list-item-amount', 'data-testid': `authorization-amount-${a.authorization_id}` }, [money(a.amount)]),
+      h('span', { class: 'list-item-meta' }, [
+        a.status === 'open' ? 'Expires ' : 'Expiry ',
+        humanTime(a.expires_at),
+        ' · ',
+        h('span', { 'data-testid': `authorization-expires-${id}` }, [a.expires_at]),
+      ]),
     ];
-    if (a.status === 'captured') {
-      children.push(h('span', { class: 'list-item-meta', 'data-testid': `authorization-captured-${a.authorization_id}` }, [money(a.captured_amount)]));
+    if (a.captured_amount > 0 && a.status !== 'captured') {
+      main.push(h('span', { class: 'list-item-meta' }, [`Collected ${moneyOf(a.captured_amount)} so far`]));
     }
+    if (a.note) main.push(h('span', { class: 'list-item-note' }, [a.note]));
+    const amountBlock = [h('span', { class: 'list-item-amount', 'data-testid': `authorization-amount-${id}` }, [moneyOf(a.amount)])];
+    if (a.status === 'captured') {
+      amountBlock.push(h('span', { class: 'list-item-meta' }, ['Collected ', h('span', { 'data-testid': `authorization-captured-${id}` }, [moneyOf(a.captured_amount)])]));
+    }
+
     const actions = [];
     if (isIncoming && a.status === 'open') {
-      const captureAmountField = h('input', {
+      const amountInput = h('input', {
         type: 'text',
-        'data-testid': `authorization-capture-amount-${a.authorization_id}`,
-        value: String((a.remaining_amount / Math.pow(10, state.me.minor_units)).toFixed(state.me.minor_units)),
+        inputmode: 'decimal',
+        autocomplete: 'off',
+        'aria-label': `Amount to collect from ${a.from_handle}`,
+        'data-testid': `authorization-capture-amount-${id}`,
+        value: minorToDecimal(a.remaining_amount, state.me.minor_units),
       });
-      actions.push(captureAmountField);
-      actions.push(h('button', {
-        class: 'btn small',
-        'data-testid': `authorization-capture-${a.authorization_id}`,
-        onclick: async () => {
-          const amt = parseAmount(captureAmountField.value, state.me.minor_units);
-          if (amt === null) {
-            renderError('Enter a valid capture amount.');
+      const keepOpen = h('input', { type: 'checkbox', id: `keep-${id}` });
+      const captureBtn = h('button', { class: 'btn small', 'data-testid': `authorization-capture-${id}` }, ['Collect']);
+      guarded(captureBtn, async () => {
+        const amt = parseAmount(amountInput.value, state.me.minor_units);
+        if (amt === null) {
+          msg.show('error', 'Enter a valid amount to collect.', 'authorization-error');
+          return;
+        }
+        // Default (spec): a capture is final and releases the rest. Ticking
+        // "keep the rest on hold" sends final:false for further captures.
+        const body = { amount: amt, final: !keepOpen.checked };
+        const keyId = `cap:${id}:${JSON.stringify(body)}`;
+        try {
+          await apiFetch(`/authorizations/${id}/capture`, { method: 'POST', key: pendingKey(keyId), body });
+          settleKey(keyId);
+          msg.show('success', `Collected ${moneyOf(amt)} from ${a.from_handle}.`);
+        } catch (e) {
+          if (e instanceof UncertainError) {
+            msg.show('uncertain', UNCERTAIN_TEXT, 'authorization-uncertain');
             return;
           }
-          try {
-            await apiFetch(`/authorizations/${a.authorization_id}/capture`, {
-              method: 'POST',
-              key: newIdempotencyKey(),
-              body: { amount: amt, final: amt >= a.remaining_amount },
-            });
-            renderError(null);
-            await load();
-          } catch (e) {
-            renderError(e.message);
-            await load();
-          }
-        },
-      }, ['Capture']));
+          settleKey(keyId);
+          msg.show('error', e.message, 'authorization-error');
+        }
+        await load();
+      });
+      actions.push(h('div', { class: 'capture-row' }, [
+        amountInput,
+        captureBtn,
+        h('label', { class: 'keep-open', for: `keep-${id}` }, [keepOpen, ' Keep the rest on hold']),
+      ]));
     }
     if (isOutgoing && a.status === 'open') {
-      actions.push(h('button', {
-        class: 'btn secondary small',
-        'data-testid': `authorization-void-${a.authorization_id}`,
-        onclick: async () => {
-          try {
-            await apiFetch(`/authorizations/${a.authorization_id}/void`, { method: 'POST' });
-            renderError(null);
-            await load();
-          } catch (e) {
-            renderError(e.message);
-            await load();
-          }
-        },
-      }, ['Void']));
+      const voidBtn = h('button', { class: 'btn secondary small', 'data-testid': `authorization-void-${id}` }, ['Release hold']);
+      guarded(voidBtn, async () => {
+        try {
+          await apiFetch(`/authorizations/${id}/void`, { method: 'POST' });
+          msg.show('success', 'Hold released.');
+        } catch (e) {
+          if (e instanceof UncertainError) msg.show('uncertain', UNCERTAIN_TEXT, 'authorization-uncertain');
+          else msg.show('error', e.message, 'authorization-error');
+        }
+        await load();
+      });
+      actions.push(voidBtn);
     }
-    return h('li', { class: 'list-item', 'data-testid': `authorization-item-${a.authorization_id}`, 'data-status': a.status }, [
-      ...children,
+    return h('li', { class: 'list-item', 'data-testid': `authorization-item-${id}`, 'data-status': a.status }, [
+      h('div', { class: 'list-item-main' }, main),
+      h('div', { class: 'list-item-amount-block' }, amountBlock),
       h('div', { class: 'list-item-actions' }, actions),
     ]);
   }
 
-  main.appendChild(authorizeForm);
-  main.appendChild(h('div', { class: 'card' }, [h('h2', {}, ['Authorizations']), errorSlot, listSlot, emptySlot]));
+  main.appendChild(buildAuthorizeForm(load));
+  main.appendChild(h('section', { class: 'card' }, [h('h2', {}, ['Holds']), msg, loadingSlot, listSlot, emptySlot]));
   await load();
 }
 

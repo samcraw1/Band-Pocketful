@@ -269,3 +269,38 @@ main {
 }
 
 .loading-text { color: var(--text-muted); font-size: 0.9rem; }
+
+/* ---- Stage 2 audit additions ------------------------------------------ */
+.msg { display: flex; gap: var(--space-2); align-items: flex-start; margin-bottom: var(--space-3); line-height: 1.35; }
+.msg::before { font-weight: 700; flex: none; }
+.msg.error::before { content: "\2715"; }
+.msg.success::before { content: "\2713"; }
+.msg.uncertain::before { content: "?"; }
+.msg-slot:empty { display: none; }
+.msg.error { border-left: 4px solid var(--danger); }
+.msg.success { border-left: 4px solid var(--success); }
+.msg.uncertain { border-left: 4px solid var(--warn); }
+.hint { margin: 0 0 var(--space-3); color: var(--text-muted); font-size: 0.9rem; }
+.balance-row { display: flex; justify-content: space-between; align-items: flex-start; gap: var(--space-3); }
+.balance-label { color: var(--text-muted); font-size: 0.85rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; }
+.balance-sub .held { color: var(--warn); }
+.direction-tag { font-size: 0.7rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em; border-radius: 4px; padding: 1px 6px; margin-right: var(--space-2); }
+.direction-tag.sent { background: #eef2ff; color: var(--primary-dark); }
+.direction-tag.received { background: var(--success-bg); color: var(--success); }
+.list-item-note { font-size: 0.85rem; color: var(--text); overflow-wrap: anywhere; }
+.list-item-main { min-width: 0; overflow-wrap: anywhere; }
+.list-item-amount-block { display: flex; flex-direction: column; align-items: flex-end; gap: 2px; }
+.list-item-actions { flex-wrap: wrap; align-items: center; }
+.capture-row { display: flex; flex-wrap: wrap; gap: var(--space-2); align-items: center; }
+.capture-row input[type="text"] { width: 7.5rem; padding: 6px 10px; border: 1px solid var(--border); border-radius: 8px; }
+.keep-open { font-size: 0.8rem; color: var(--text-muted); }
+.split-shares-title { font-size: 0.8rem; font-weight: 600; color: var(--text-muted); }
+.btn[disabled] { opacity: 0.6; cursor: progress; }
+input:focus-visible, select:focus-visible, button:focus-visible, a:focus-visible, .field input:focus, .field select:focus {
+  outline: 3px solid var(--primary);
+  outline-offset: 2px;
+}
+@media (max-width: 640px) {
+  .list-item { flex-wrap: wrap; }
+  .list-item-actions { width: 100%; }
+}
