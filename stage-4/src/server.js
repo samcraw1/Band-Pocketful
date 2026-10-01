@@ -61,12 +61,14 @@ function freshState() {
     authorizationTtlSeconds: 600,
     settlementOperatorIds: new Set(),
     idempotency: new Map(), // userId -> Map(key -> record)
-    counters: { user: 0, payment: 0, request: 0, split: 0, settlement: 0, authorization: 0, token: 0 },
+    counters: { user: 0, payment: 0, request: 0, split: 0, settlement: 0, authorization: 0, batch: 0, token: 0 },
     seq: 0, // monotonic tiebreaker for ordering
     // Stage 3: per-user indexes (so statements and as_of reads never scan every
     // payment), statement snapshots, and the payment clock's high-water mark.
     userPayments: new Map(), // userId -> payments the user sent or received
     userAuths: new Map(), // payer userId -> authorizations
+    batches: new Map(), // correction batch id -> { id, recordedAt }
+    refundsOf: new Map(), // target payment id -> refund payments
     ledgerVersion: 0, // bumped whenever a payment or revision is added
     statementCache: new Map(),
     statementCacheVersion: 0,
@@ -78,7 +80,7 @@ function freshState() {
 
 let state = freshState();
 
-const ID_PREFIX = { user: 'u', payment: 'p', request: 'rq', split: 'sp', settlement: 'st', authorization: 'a' };
+const ID_PREFIX = { user: 'u', payment: 'p', request: 'rq', split: 'sp', settlement: 'st', authorization: 'a', batch: 'cb' };
 const ID_MAP_FOR = {
   user: () => state.users,
   payment: () => state.payments,
@@ -86,6 +88,7 @@ const ID_MAP_FOR = {
   split: () => state.splits,
   settlement: () => state.settlements,
   authorization: () => state.authorizations,
+  batch: () => state.batches,
 };
 
 // A generated id must never equal any existing id of that kind (seeded or
@@ -277,8 +280,8 @@ function temporalParam(query, name) {
 
 // ---- revisions and payments ------------------------------------------------
 
-function makeRevision(revision, amount, effectiveAt, effNs, recordedAt, recNs, reason) {
-  const r = { revision, amount, effectiveAt, recordedAt, reason };
+function makeRevision(revision, amount, effectiveAt, effNs, recordedAt, recNs, reason, correctionBatchId = null) {
+  const r = { revision, amount, effectiveAt, recordedAt, reason, correctionBatchId };
   hidden(r, 'effNs', effNs);
   hidden(r, 'recNs', recNs);
   return r;
@@ -292,6 +295,7 @@ function revisionView(p, r) {
     effective_at: r.effectiveAt,
     recorded_at: r.recordedAt,
     reason: r.reason,
+    correction_batch_id: r.correctionBatchId === undefined ? null : r.correctionBatchId,
   };
 }
 
@@ -314,12 +318,32 @@ function indexPayment(st, p) {
   }
 }
 
+// Refunds are indexed under the payment they refund.
+function indexRefund(st, p) {
+  if (!p.refundOf) return;
+  let list = st.refundsOf.get(p.refundOf);
+  if (!list) {
+    list = [];
+    st.refundsOf.set(p.refundOf, list);
+  }
+  list.push(p);
+}
+
+// Total already refunded against a payment.
+function refundedTotal(p) {
+  let total = 0;
+  for (const r of state.refundsOf.get(p.id) || []) total += r.amount;
+  return total;
+}
+
 // Registers a payment with revision 1 (effective = recorded = created_at).
 function registerPayment(st, p, createdNs) {
   hidden(p, 'createdNs', createdNs);
+  if (p.refundOf === undefined) p.refundOf = null;
   p.revisions = [makeRevision(1, p.amount, p.createdAt, createdNs, p.createdAt, createdNs, '')];
   st.payments.set(p.id, p);
   indexPayment(st, p);
+  indexRefund(st, p);
   st.ledgerVersion += 1;
 }
 
@@ -449,13 +473,26 @@ function statementEntryView(e) {
 // latest known revisions? Movements and hold events at one instant are
 // combined before the balance is judged.
 function wouldOverdraft(p, newAmount, newEffNs) {
+  return wouldOverdraftWith(new Map([[p, { amount: newAmount, effNs: newEffNs }]]));
+}
+
+// The same check for several tentative revisions applied together (a batch):
+// `overrides` maps each payment to the amount and effective instant its new
+// latest revision would have. Every party of every overridden payment is judged.
+function wouldOverdraftWith(overrides) {
   const nowNs = peekNs();
-  for (const uid of new Set([p.fromUserId, p.toUserId])) {
+  const affected = new Set();
+  for (const p of overrides.keys()) {
+    affected.add(p.fromUserId);
+    affected.add(p.toUserId);
+  }
+  for (const uid of affected) {
     const user = state.users.get(uid);
     const ev = []; // [instant, change in total, change in held]
     for (const q of paymentsOf(state, uid)) {
-      if (q === p) {
-        ev.push([newEffNs, deltaFor(q, newAmount, uid), 0]);
+      const o = overrides.get(q);
+      if (o) {
+        ev.push([o.effNs, deltaFor(q, o.amount, uid), 0]);
       } else {
         const rev = latestRevision(q);
         ev.push([rev.effNs, deltaFor(q, rev.amount, uid), 0]);
@@ -705,6 +742,7 @@ function paymentView(p) {
     request_id: p.requestId,
     settlement_id: p.settlementId,
     authorization_id: p.authorizationId || null,
+    refund_of: p.refundOf || null,
     created_at: p.createdAt,
   };
 }
@@ -1116,8 +1154,34 @@ function deepCopy(v) {
   return JSON.parse(JSON.stringify(v));
 }
 
+// Frozen statement snapshots travel with an export so a token issued before it
+// still pages the same result after import. Identical results are written once
+// and shared by their tokens; entries are compact [paymentId, revision, delta,
+// balance_after] rows that import resolves back to the immutable records.
+function serializeSnapshots() {
+  const resultIndex = new Map();
+  const snapshotResults = [];
+  const snapshotTokens = [];
+  for (const [token, snap] of state.snapshots) {
+    let idx = resultIndex.get(snap);
+    if (idx === undefined) {
+      idx = snapshotResults.length;
+      resultIndex.set(snap, idx);
+      snapshotResults.push({
+        userId: snap.userId,
+        opening: snap.opening,
+        closing: snap.closing,
+        entries: snap.entries.map((e) => [e.p.id, e.rev.revision, e.delta, e.balanceAfter]),
+      });
+    }
+    snapshotTokens.push({ token, result: idx });
+  }
+  return { snapshotResults, snapshotTokens };
+}
+
 function serializeState() {
   return {
+    ...serializeSnapshots(),
     currency: state.currency,
     minorUnits: state.minorUnits,
     users: [...state.users.values()],
@@ -1208,6 +1272,7 @@ function validateImportSemantics(s) {
 
   const paymentIds = new Set();
   const paymentById = new Map();
+  const batchRecorded = new Map();
   for (const p of s.payments) {
     if (!isPlainObject(p)) throw err(422, 'validation_failed', 'invalid payment record');
     const { id, fromUserId, toUserId, amount, note, visibility, requestId, settlementId, authorizationId, createdAt } = p;
@@ -1244,6 +1309,11 @@ function validateImportSemantics(s) {
     const createdNs = parseInstant(createdAt);
     if (createdNs === null) throw err(422, 'validation_failed', 'invalid payment created_at');
     hidden(p, 'createdNs', createdNs);
+    // Stage 4: refund_of (absent in a Stage 1-3 export = not a refund).
+    if (p.refundOf === undefined) p.refundOf = null;
+    if (p.refundOf !== null && (typeof p.refundOf !== 'string' || p.refundOf.length === 0)) {
+      throw err(422, 'validation_failed', 'invalid payment refund_of');
+    }
     // Revision history. A Stage 1/2 export has none: revision 1 is the payment
     // as it was paid, effective and recorded at created_at.
     if (p.revisions === undefined) {
@@ -1259,6 +1329,10 @@ function validateImportSemantics(s) {
           throw err(422, 'validation_failed', 'invalid revision amount');
         }
         if (typeof r.reason !== 'string') throw err(422, 'validation_failed', 'invalid revision reason');
+        const batchId = r.correctionBatchId === undefined ? null : r.correctionBatchId;
+        if (batchId !== null && (typeof batchId !== 'string' || batchId.length === 0)) {
+          throw err(422, 'validation_failed', 'invalid revision correction_batch_id');
+        }
         const effNs = parseInstant(r.effectiveAt);
         const recNs = parseInstant(r.recordedAt);
         if (effNs === null || recNs === null) throw err(422, 'validation_failed', 'invalid revision instant');
@@ -1270,8 +1344,36 @@ function validateImportSemantics(s) {
         // authoritative for its amount and times (import has never cross-checked
         // those fields), so a stored revision 1 is normalised to it.
         if (i === 0) return makeRevision(1, amount, createdAt, createdNs, createdAt, createdNs, '');
-        return makeRevision(r.revision, r.amount, r.effectiveAt, effNs, r.recordedAt, recNs, r.reason);
+        if (batchId !== null) {
+          if (batchRecorded.has(batchId) && batchRecorded.get(batchId) !== recNs) {
+            throw err(422, 'validation_failed', 'revisions of one batch must share recorded_at');
+          }
+          batchRecorded.set(batchId, recNs);
+        }
+        return makeRevision(r.revision, r.amount, r.effectiveAt, effNs, r.recordedAt, recNs, r.reason, batchId);
       });
+    }
+  }
+
+  // Refunds must be consistent with the payments they refund.
+  const refundTotals = new Map();
+  for (const p of s.payments) {
+    if (p.refundOf === null) continue;
+    const target = paymentById.get(p.refundOf);
+    if (!target) throw err(422, 'validation_failed', 'refund references an unknown payment');
+    if (target.refundOf !== null) throw err(422, 'validation_failed', 'a refund cannot refund a refund');
+    if (p.fromUserId !== target.toUserId || p.toUserId !== target.fromUserId) {
+      throw err(422, 'validation_failed', 'a refund must reverse the payment it refunds');
+    }
+    if (p.requestId !== null || p.settlementId !== null || (p.authorizationId !== undefined && p.authorizationId !== null)) {
+      throw err(422, 'validation_failed', 'a refund carries no request, settlement or authorization link');
+    }
+    refundTotals.set(target.id, (refundTotals.get(target.id) || 0) + p.amount);
+  }
+  for (const [tid, total] of refundTotals) {
+    const t = paymentById.get(tid);
+    if (total > t.revisions[t.revisions.length - 1].amount) {
+      throw err(422, 'validation_failed', 'refunds exceed the corrected payment amount');
     }
   }
 
@@ -1432,6 +1534,33 @@ function validateImportSemantics(s) {
     }
   }
 
+  // Statement snapshots (absent in a Stage 1-3 export).
+  const snapshotResults = s.snapshotResults === undefined ? [] : s.snapshotResults;
+  const snapshotTokens = s.snapshotTokens === undefined ? [] : s.snapshotTokens;
+  if (!Array.isArray(snapshotResults) || !Array.isArray(snapshotTokens)) {
+    throw err(422, 'validation_failed', 'invalid snapshots');
+  }
+  for (const r of snapshotResults) {
+    if (!isPlainObject(r) || !userIds.has(r.userId) || !isIntegralNumber(r.opening) || !isIntegralNumber(r.closing) || !Array.isArray(r.entries)) {
+      throw err(422, 'validation_failed', 'invalid snapshot result');
+    }
+    for (const e of r.entries) {
+      if (!Array.isArray(e) || e.length !== 4) throw err(422, 'validation_failed', 'invalid snapshot entry');
+      const pay = typeof e[0] === 'string' ? paymentById.get(e[0]) : undefined;
+      if (!pay || !isIntegralNumber(e[1]) || e[1] < 1 || e[1] > pay.revisions.length || !isIntegralNumber(e[2]) || !isIntegralNumber(e[3])) {
+        throw err(422, 'validation_failed', 'invalid snapshot entry');
+      }
+    }
+  }
+  const seenTokens = new Set();
+  for (const t of snapshotTokens) {
+    if (!isPlainObject(t) || typeof t.token !== 'string' || t.token.length === 0 || t.token.length > 255
+      || !isIntegralNumber(t.result) || t.result < 0 || t.result >= snapshotResults.length || seenTokens.has(t.token)) {
+      throw err(422, 'validation_failed', 'invalid snapshot token');
+    }
+    seenTokens.add(t.token);
+  }
+
   for (const entry of s.idempotency) {
     if (!isPlainObject(entry) || typeof entry.userId !== 'string' || !Array.isArray(entry.records)) {
       throw err(422, 'validation_failed', 'invalid idempotency entry');
@@ -1492,7 +1621,11 @@ function importSnapshot(snapshot) {
   for (const p of s.payments) {
     newState.payments.set(p.id, p);
     indexPayment(newState, p);
-    for (const r of p.revisions) if (r.recNs > maxNs) maxNs = r.recNs;
+    indexRefund(newState, p);
+    for (const r of p.revisions) {
+      if (r.recNs > maxNs) maxNs = r.recNs;
+      if (r.correctionBatchId) newState.batches.set(r.correctionBatchId, { id: r.correctionBatchId, recordedAt: r.recordedAt });
+    }
     if (p.createdNs > maxNs) maxNs = p.createdNs;
   }
   for (const r of s.requests) newState.requests.set(r.id, r);
@@ -1535,6 +1668,18 @@ function importSnapshot(snapshot) {
   seedCounterFromIds(newState, 'split', [...newState.splits.keys()]);
   seedCounterFromIds(newState, 'settlement', [...newState.settlements.keys()]);
   seedCounterFromIds(newState, 'authorization', [...newState.authorizations.keys()]);
+  seedCounterFromIds(newState, 'batch', [...newState.batches.keys()]);
+  // Restore the frozen statement snapshots, replacing any in the destination.
+  const restored = (s.snapshotResults || []).map((r) => ({
+    userId: r.userId,
+    opening: r.opening,
+    closing: r.closing,
+    entries: r.entries.map(([pid, revision, delta, balanceAfter]) => {
+      const p = newState.payments.get(pid);
+      return { p, rev: p.revisions[revision - 1], delta, balanceAfter };
+    }),
+  }));
+  for (const t of s.snapshotTokens || []) newState.snapshots.set(t.token, restored[t.result]);
   newState.seq = s.seq;
   // Single synchronous assignment: no handler can ever observe a
   // half-swapped state (MAJOR-3).
@@ -1995,8 +2140,8 @@ function doCorrection(user, paymentId, body) {
   const p = state.payments.get(paymentId);
   if (!p) throw err(404, 'not_found', 'no such payment');
   if (p.fromUserId !== user.id) throw err(403, 'forbidden', 'only the sender may correct a payment');
-  if (p.settlementId !== null || p.authorizationId) {
-    throw err(422, 'linked_payment_immutable', 'settlement members and captures cannot be corrected');
+  if (p.settlementId !== null || p.authorizationId || p.refundOf) {
+    throw err(422, 'linked_payment_immutable', 'settlement members, captures and refunds cannot be corrected');
   }
 
   const { expected_revision: expectedRevision, amount, effective_at: effectiveAt, reason } = body;
@@ -2015,6 +2160,7 @@ function doCorrection(user, paymentId, body) {
 
   const latest = latestRevision(p);
   if (expectedRevision !== latest.revision) throw err(409, 'stale_revision', 'the payment has a newer revision');
+  if (amount < refundedTotal(p)) throw err(422, 'refund_exceeds_payment', 'cannot correct below the amount already refunded');
 
   // The difference moves between the same two wallets: an increase debits the
   // sender, a decrease debits the receiver. A current shortfall wins over a
@@ -2044,6 +2190,160 @@ function doListRevisions(user, paymentId) {
   // A third party learns nothing about the payment, public or not.
   if (!p || (p.fromUserId !== user.id && p.toUserId !== user.id)) throw err(404, 'not_found', 'no such payment');
   return { status: 200, body: { revisions: p.revisions.map((r) => revisionView(p, r)) } };
+}
+
+
+// ---------------------------------------------------------------------------
+// Stage 4: refunds and batch corrections
+// ---------------------------------------------------------------------------
+
+// POST /payments/{id}/refunds: the original receiver sends part (or all) of a
+// payment back as a NEW payment in the opposite direction. The refund never
+// touches the original, its request, its authorization or any settlement.
+function doRefund(user, paymentId, body) {
+  if (!isPlainObject(body)) throw err(400, 'malformed_request', 'body must be an object');
+  const target = state.payments.get(paymentId);
+  if (!target) throw err(404, 'not_found', 'no such payment');
+  if (target.toUserId !== user.id) throw err(403, 'forbidden', 'only the receiver may refund a payment');
+  if (target.refundOf) throw err(422, 'invalid_refund_target', 'a refund cannot be refunded');
+  const amt = validateAmount(body.amount);
+  // Cumulative refunds may not exceed what the payment is currently worth.
+  if (refundedTotal(target) + amt > latestRevision(target).amount) {
+    throw err(422, 'refund_exceeds_payment', 'refunds would exceed the payment amount');
+  }
+  // Money comes from the refunder's available funds; held funds do not count.
+  if (user.balance - heldAmount(user.id) < amt) throw err(409, 'insufficient_funds', 'balance too low');
+
+  const sender = state.users.get(target.fromUserId);
+  user.balance -= amt;
+  sender.balance += amt;
+  const id = nextId('payment');
+  const stamp = stampNow();
+  const payment = {
+    id,
+    fromUserId: user.id,
+    toUserId: target.fromUserId,
+    amount: amt,
+    note: target.note,
+    visibility: target.visibility,
+    requestId: null,
+    settlementId: null,
+    authorizationId: null,
+    refundOf: target.id,
+    createdAt: stamp.iso,
+    seq: nextSeq(),
+  };
+  registerPayment(state, payment, stamp.ns);
+  return { status: 201, body: paymentView(payment) };
+}
+
+// POST /correction-batches: a settlement operator corrects up to 32 payments
+// atomically. Errors are judged in the specified order: batch shape, items in
+// input order, settlement completeness, current affordability of the combined
+// effect, then the historical boundaries.
+function doCorrectionBatch(user, body) {
+  if (!isPlainObject(body)) throw err(400, 'malformed_request', 'body must be an object');
+  if (!state.settlementOperatorIds.has(user.id)) throw err(403, 'forbidden', 'not an operator');
+  const { corrections } = body;
+  if (!Array.isArray(corrections) || corrections.length < 1 || corrections.length > 32) {
+    throw err(422, 'validation_failed', 'corrections must have 1..32 entries');
+  }
+  const seen = new Set();
+  for (const c of corrections) {
+    if (!isPlainObject(c)) throw err(422, 'validation_failed', 'invalid correction shape');
+    if (typeof c.payment_id === 'string') {
+      if (seen.has(c.payment_id)) throw err(422, 'validation_failed', 'payment_ids must be distinct');
+      seen.add(c.payment_id);
+    }
+  }
+
+  // Item errors, in input order; the first failing item wins.
+  const nowNs = peekNs();
+  const items = [];
+  for (const c of corrections) {
+    const { payment_id: paymentId, expected_revision: expectedRevision, amount, effective_at: effectiveAt, reason } = c;
+    if (typeof paymentId !== 'string' || paymentId.length === 0) throw err(422, 'validation_failed', 'payment_id must be a string');
+    if (!isIntegralNumber(expectedRevision) || expectedRevision < 1) {
+      throw err(422, 'validation_failed', 'expected_revision must be a positive integer');
+    }
+    if (!isIntegralNumber(amount) || amount < 0 || amount > 1000000000) {
+      throw err(422, 'validation_failed', 'amount must be an integer from 0 to 1000000000');
+    }
+    if (typeof reason !== 'string' || [...reason].length < 1 || [...reason].length > 200) {
+      throw err(422, 'validation_failed', 'reason must be 1..200 characters');
+    }
+    const effNs = parseInstant(effectiveAt);
+    if (effNs === null) throw err(422, 'validation_failed', 'effective_at must be an RFC 3339 instant with an offset');
+    if (effNs > nowNs) throw err(422, 'validation_failed', 'effective_at cannot be in the future');
+    const p = state.payments.get(paymentId);
+    if (!p) throw err(404, 'not_found', 'no such payment');
+    if (p.authorizationId || p.refundOf) {
+      throw err(422, 'linked_payment_immutable', 'captures and refunds cannot be corrected');
+    }
+    const latest = latestRevision(p);
+    if (expectedRevision !== latest.revision) throw err(409, 'stale_revision', 'the payment has a newer revision');
+    if (amount < refundedTotal(p)) throw err(422, 'refund_exceeds_payment', 'cannot correct below the amount already refunded');
+    items.push({ p, latest, amount, effNs, effectiveAt, reason });
+  }
+
+  // Settlement completeness: every member, or none; and one instant for all.
+  const bySettlement = new Map();
+  for (const it of items) {
+    if (!it.p.settlementId) continue;
+    if (!bySettlement.has(it.p.settlementId)) bySettlement.set(it.p.settlementId, []);
+    bySettlement.get(it.p.settlementId).push(it);
+  }
+  const included = new Set(items.map((it) => it.p.id));
+  for (const [sid, its] of bySettlement) {
+    const settlement = state.settlements.get(sid);
+    const members = settlement ? settlement.paymentIds : its.map((it) => it.p.id);
+    for (const pid of members) {
+      if (!included.has(pid)) throw err(422, 'incomplete_settlement', 'every member of a settlement must be corrected together');
+    }
+  }
+  for (const its of bySettlement.values()) {
+    for (const it of its) {
+      if (it.effNs !== its[0].effNs) throw err(422, 'validation_failed', 'settlement members need identical effective instants');
+    }
+  }
+
+  // Current affordability is judged on the COMBINED effect of all items.
+  const change = new Map();
+  for (const it of items) {
+    const delta = it.amount - it.latest.amount;
+    change.set(it.p.fromUserId, (change.get(it.p.fromUserId) || 0) - delta);
+    change.set(it.p.toUserId, (change.get(it.p.toUserId) || 0) + delta);
+  }
+  for (const [uid, ch] of change) {
+    if (state.users.get(uid).balance + ch - heldAmount(uid) < 0) {
+      throw err(409, 'insufficient_funds', 'the batch is not affordable');
+    }
+  }
+
+  // Historical boundaries under all the tentative revisions together.
+  const overrides = new Map();
+  for (const it of items) overrides.set(it.p, { amount: it.amount, effNs: it.effNs });
+  if (wouldOverdraftWith(overrides)) throw err(409, 'historical_overdraft', 'the batch would overdraw a wallet in the past');
+
+  // Commit: one recorded instant, later than every member's previous one.
+  let recNs = tickNs();
+  let maxPrev = 0n;
+  for (const it of items) if (it.latest.recNs > maxPrev) maxPrev = it.latest.recNs;
+  if (recNs <= maxPrev) recNs = maxPrev + CLOCK_RES;
+  if (recNs > state.lastNs) state.lastNs = recNs;
+  const recordedAt = nsToIso(recNs);
+  const batchId = nextId('batch');
+  state.batches.set(batchId, { id: batchId, recordedAt });
+  const revisions = items.map((it) => {
+    const rev = makeRevision(it.latest.revision + 1, it.amount, it.effectiveAt, it.effNs, recordedAt, recNs, it.reason, batchId);
+    it.p.revisions.push(rev);
+    const delta = it.amount - it.latest.amount;
+    state.users.get(it.p.fromUserId).balance -= delta;
+    state.users.get(it.p.toUserId).balance += delta;
+    return revisionView(it.p, rev);
+  });
+  state.ledgerVersion += 1;
+  return { status: 201, body: { correction_batch_id: batchId, recorded_at: recordedAt, revisions } };
 }
 
 // ---------------------------------------------------------------------------
@@ -2303,6 +2603,23 @@ async function route(req, res) {
     return json(res, result.status, result.body);
   }
 
+  const refundMatch = /^\/payments\/([^/]+)\/refunds$/.exec(pathname);
+  if (method === 'POST' && refundMatch) {
+    authenticate(req);
+    const body = await parseJsonBody(req);
+    const user = authenticate(req);
+    const result = withIdempotency(user, method, pathname, req, body, () => doRefund(user, refundMatch[1], body));
+    return json(res, result.status, result.body);
+  }
+
+  if (method === 'POST' && pathname === '/correction-batches') {
+    authenticate(req);
+    const body = await parseJsonBody(req);
+    const user = authenticate(req);
+    const result = withIdempotency(user, method, pathname, req, body, () => doCorrectionBatch(user, body));
+    return json(res, result.status, result.body);
+  }
+
   const correctionMatch = /^\/payments\/([^/]+)\/corrections$/.exec(pathname);
   if (method === 'POST' && correctionMatch) {
     authenticate(req);
@@ -2475,7 +2792,7 @@ server.on('clientError', (err_, socket) => {
 
 server.listen(PORT, '0.0.0.0', () => {
   // eslint-disable-next-line no-console
-  console.log(`pocketful stage-3 listening on 0.0.0.0:${PORT}`);
+  console.log(`pocketful stage-4 listening on 0.0.0.0:${PORT}`);
 });
 
 module.exports = { server, applyFixture };

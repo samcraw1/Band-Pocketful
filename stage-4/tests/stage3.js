@@ -331,7 +331,8 @@ async function main() {
     const k = K();
     const c = await correct(w.ada, p.payment_id, { expected_revision: 1, amount: 400, effective_at: p.created_at, reason: 'corrected amount' }, k);
     assert.strictEqual(c.status, 201, c.text);
-    assert.deepStrictEqual(Object.keys(c.json).sort(), ['amount', 'effective_at', 'payment_id', 'reason', 'recorded_at', 'revision']);
+    assert.deepStrictEqual(Object.keys(c.json).sort(), ['amount', 'correction_batch_id', 'effective_at', 'payment_id', 'reason', 'recorded_at', 'revision']);
+    assert.strictEqual(c.json.correction_batch_id, null);
     assert.deepStrictEqual([c.json.payment_id, c.json.revision, c.json.amount, c.json.effective_at, c.json.reason], [p.payment_id, 2, 400, p.created_at, 'corrected amount']);
     assert.ok(c.json.recorded_at > p.created_at);
     assert.deepStrictEqual(await bal(w), { ada: 9600, bob: 2900, cy: 500 }, 'a decrease returns 600 from the receiver');
@@ -347,7 +348,7 @@ async function main() {
     assert.deepStrictEqual([s.entries[0].payment.amount, s.entries[0].revision, s.entries[0].delta], [1500, 3, -1500], 'statement shows the selected amount');
     const rev = (await req('GET', `/payments/${p.payment_id}/revisions`, { token: w.ada })).json.revisions;
     assert.deepStrictEqual(rev.map((r) => [r.revision, r.amount, r.reason]), [[1, 1000, ''], [2, 400, 'corrected amount'], [3, 1500, 'bigger']]);
-    assert.deepStrictEqual(Object.keys(rev[0]).sort(), ['amount', 'effective_at', 'payment_id', 'reason', 'recorded_at', 'revision']);
+    assert.deepStrictEqual(Object.keys(rev[0]).sort(), ['amount', 'correction_batch_id', 'effective_at', 'payment_id', 'reason', 'recorded_at', 'revision']);
     assert.ok(rev[0].recorded_at < rev[1].recorded_at && rev[1].recorded_at < rev[2].recorded_at, 'recorded times strictly increase');
     assert.strictEqual((await req('GET', '/activity', { token: w.ada })).json.payments.find((x) => x.payment_id === p.payment_id).amount, 1000);
   });
@@ -643,11 +644,19 @@ async function main() {
     assert.ok(next.json.recorded_at > c.recorded_at);
     const p = (await pay(w.ada, 'bob', 3)).json;
     assert.ok(p.created_at > next.json.recorded_at, 'the clock continues after the imported history');
-    const snap = (await stmt(w.ada)).snapshot;
+    // Stage 4: frozen snapshots travel with an export and are restored by import.
+    const first = await stmt(w.ada);
+    const frozenBefore = (await req('GET', `/statement?snapshot=${first.snapshot}&limit=200`, { token: w.ada })).json;
     const exp2 = await req('GET', '/_test/export');
-    assert.ok(!exp2.text.includes(snap), 'snapshots are not exported');
+    assert.ok(exp2.text.includes(first.snapshot), 'snapshots are exported');
+    await pay(w.ada, 'bob', 11);
     assert.strictEqual((await req('POST', '/_test/import', { rawBody: exp2.text })).status, 204);
-    err(await req('GET', `/statement?snapshot=${snap}`, { token: w.ada }), 404, 'not_found');
+    const frozenAfter = await req('GET', `/statement?snapshot=${first.snapshot}&limit=200`, { token: w.ada });
+    assert.strictEqual(frozenAfter.status, 200);
+    assert.deepStrictEqual(frozenAfter.json, frozenBefore, 'a token issued before export pages the same result after import');
+    err(await req('GET', `/statement?snapshot=${first.snapshot}`, { token: w.bob }), 404, 'not_found');
+    await reset(HISTORY());
+    err(await req('GET', `/statement?snapshot=${first.snapshot}`, { token: await login('ada') }), 404, 'not_found');
   });
 
   await test('import validation: inconsistent revisions are 422 and never change the destination', async () => {

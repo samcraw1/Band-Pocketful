@@ -1,8 +1,8 @@
 {
-  "name": "pocketful-stage-3",
+  "name": "pocketful-stage-4",
   "version": "1.0.0",
   "private": true,
-  "description": "Pocketful Stage 3 — statements and payment corrections",
+  "description": "Pocketful Stage 4 — refunds and batch corrections",
   "main": "src/server.js",
   "scripts": {
     "start": "node src/server.js"
