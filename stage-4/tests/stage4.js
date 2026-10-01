@@ -346,11 +346,27 @@ async function main() {
     assert.ok(r.json.recorded_at > ps[31].created_at);
     const list = await revisions(w.ada, ps[5].payment_id);
     assert.deepStrictEqual(list.map((x) => [x.revision, x.correction_batch_id ?? null]), [[1, null], [2, r.json.correction_batch_id]]);
-    assert.ok(!('correction_batch_id' in list[0]), 'non-batch revisions keep the Stage 3 shape');
+    assert.strictEqual(list[0].correction_batch_id, null, 'every revision exposes correction_batch_id: null on non-batch ones');
     const s = await stmt(w.ada, '?limit=200');
     assert.strictEqual(s.opening_balance + s.entries.reduce((a, e) => a + e.delta, 0), s.closing_balance);
     assert.strictEqual(await sumAt(w, ''), w.total);
     err(await batch(w.ada, [...items, item('p_x', 1, T1)]), 422, 'validation_failed'); // 33
+  });
+
+  await test('every revision object has correction_batch_id: null unless a batch made it (revision 1, single corrections, their 201 and replay)', async () => {
+    const w = await world();
+    const p = (await pay(w.ada, 'bob', 1000)).json;
+    const k = K();
+    const body = { expected_revision: 1, amount: 900, effective_at: p.created_at, reason: 'r' };
+    const c = await correct(w.ada, p.payment_id, body, k);
+    assert.strictEqual(c.status, 201, c.text);
+    assert.strictEqual(c.json.correction_batch_id, null);
+    assert.strictEqual((await correct(w.ada, p.payment_id, body, k)).json.correction_batch_id, null);
+    const b = await batch(w.ada, [item(p.payment_id, 800, p.created_at, { expected_revision: 2 })]);
+    assert.strictEqual(b.status, 201, b.text);
+    const rv = await revisions(w.ada, p.payment_id);
+    assert.deepStrictEqual(rv.map((x) => x.correction_batch_id), [null, null, b.json.correction_batch_id]);
+    for (const x of rv) assert.ok('correction_batch_id' in x);
   });
 
   await test('batch item errors in input order: validation, 404, immutable captures/refunds, stale, refund_exceeds; first failing item wins', async () => {
@@ -412,7 +428,7 @@ async function main() {
     assert.strictEqual((await correct(w.bob, ord.payment_id, { expected_revision: 2, amount: 120, effective_at: ord.created_at, reason: 'x' })).status, 201);
     const rv = await revisions(w.ada, m1.payment_id);
     assert.deepStrictEqual([rv.length, rv[1].correction_batch_id], [2, ok.json.correction_batch_id]);
-    assert.strictEqual(rv[0].correction_batch_id, undefined);
+    assert.strictEqual(rv[0].correction_batch_id, null);
     // a settlement member can be refunded and still be batch-corrected as a whole
     assert.strictEqual((await refund(w.bob, m1.payment_id, 20)).status, 201);
     err(await batch(w.ada, [item(m1.payment_id, 10, eff, { expected_revision: 2 }), item(m2.payment_id, 40, eff, { expected_revision: 2 }), item(m3.payment_id, 5, eff, { expected_revision: 2 })]), 422, 'refund_exceeds_payment');
