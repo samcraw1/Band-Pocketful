@@ -304,3 +304,16 @@ input:focus-visible, select:focus-visible, button:focus-visible, a:focus-visible
   .list-item { flex-wrap: wrap; }
   .list-item-actions { width: 100%; }
 }
+
+/* ---- Navigation: calm two-row layout on narrow screens, handle shown as @handle ---- */
+[data-testid="current-user"] { color: var(--text); font-weight: 600; }
+[data-testid="current-handle"] { color: var(--text-muted); }
+[data-testid="current-handle"]::before { content: "@"; }
+.nav-user { gap: var(--space-2); }
+@media (max-width: 640px) {
+  .nav { padding: var(--space-2) var(--space-3); row-gap: var(--space-1); }
+  .nav-brand { margin-right: 0; }
+  .nav-user { margin-left: auto; font-size: 0.85rem; flex-wrap: nowrap; min-width: 0; }
+  .nav-links { order: 3; width: 100%; gap: var(--space-1); justify-content: space-between; }
+  .nav-links a { padding: var(--space-1) var(--space-2); font-size: 0.9rem; }
+}

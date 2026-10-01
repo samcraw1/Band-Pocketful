@@ -415,6 +415,74 @@ def main():
             page.get_by_test_id("pay-submit").click()
             page.wait_for_function("document.querySelector('[data-testid=wallet-balance]').dataset.amount === '1000'")
 
+
+        @check("initial page-load reads delivered after a later refresh must not overwrite it (feed and balance)")
+        def _():
+            reset()
+            page = new_page()
+            login(page, "ada")
+            held = []
+
+            def hold(route):
+                if not held:
+                    held.append((route, route.fetch()))      # hold the page-load's initial read
+                else:
+                    route.continue_()
+            page.route("**/activity", hold)
+            page.goto(BASE + "/")
+            page.get_by_test_id("wallet-refresh").wait_for()
+            page.wait_for_timeout(400)
+            assert len(held) == 1
+            api("POST", "/payments", {"to_handle": "bob", "amount": 1234}, token=token("ada"), key="kinit")
+            page.get_by_test_id("wallet-refresh").click()
+            page.wait_for_function("document.querySelectorAll('[data-testid^=activity-item-]').length === 1")
+            assert amount(page, "wallet-balance") == 8766
+            route, resp = held[0]
+            route.fulfill(response=resp)       # the OLD (empty) feed arrives last
+            page.wait_for_timeout(800)
+            assert page.locator('[data-testid^="activity-item-"]').count() == 1, "stale initial feed overwrote the refresh"
+            assert amount(page, "wallet-balance") == 8766
+
+        @check("requests/authorizations list reads: latest read wins when responses arrive out of order")
+        def _():
+            reset()
+            ada, bob = token("ada"), token("bob")
+            page = new_page()
+            login(page, "bob")
+            held = []
+
+            def hold(route):
+                if route.request.resource_type != "fetch":
+                    route.continue_()          # let the page document itself through
+                elif not held:
+                    held.append((route, route.fetch()))
+                else:
+                    route.continue_()
+            page.route("**/authorizations", hold)
+            page.goto(BASE + "/authorizations")
+            page.wait_for_timeout(500)
+            assert len(held) == 1
+            _, a, _ = api("POST", "/authorizations", {"to_handle": "bob", "amount": 500}, ada, "kl1")
+            page.get_by_test_id("authorize-handle").fill("cy")
+            page.get_by_test_id("authorize-amount").fill("1.00")
+            page.get_by_test_id("authorize-submit").click()         # post-write reload (second read)
+            page.locator('[data-testid^="authorization-item-"]').nth(1).wait_for()
+            route, resp = held[0]
+            route.fulfill(response=resp)       # the OLD (empty) list arrives last
+            page.wait_for_timeout(800)
+            assert page.locator('[data-testid^="authorization-item-"]').count() == 2, "stale list overwrote the newer one"
+
+        @check("375px nav: two rows, handle rendered once as @handle")
+        def _():
+            reset()
+            page = new_page(375)
+            login(page, "ada")
+            rows = page.evaluate("""() => { const tops = [...document.querySelectorAll('.nav > *')].map(e => e.getBoundingClientRect().top).sort((a, b) => a - b); let n = 0, last = -1e9; for (const t of tops) { if (t - last > 20) n++; last = t; } return n; }""")
+            assert rows <= 2, f"nav wraps to {rows} rows"
+            assert page.get_by_test_id("current-handle").inner_text() == "ada"
+            shown = page.evaluate("getComputedStyle(document.querySelector('[data-testid=current-handle]'), '::before').content")
+            assert shown == '"@"', shown
+
         browser.close()
 
     failed = [r for r in results if not r[1]]

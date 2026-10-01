@@ -639,13 +639,9 @@ async function renderHome(main) {
   main.appendChild(buildAuthorizeForm(refreshWalletAndFeed));
   main.appendChild(activitySlot);
 
-  try {
-    const activity = await apiFetch('/activity', { accept: 'application/json' });
-    renderActivity(activitySlot, activity.payments || []);
-  } catch (e) {
-    clear(activitySlot);
-    activitySlot.appendChild(h('section', { class: 'card' }, [h('h2', {}, ['Activity']), message('error', 'Activity could not be loaded.', 'activity-error')]));
-  }
+  // The initial load goes through the same sequence-guarded read as every
+  // refresh, so a slow first response can never overwrite a later refresh.
+  await refreshWalletAndFeed();
 }
 
 function renderActivity(slot, payments) {
@@ -686,7 +682,9 @@ async function renderRequests(main) {
   const emptySlot = h('div', {});
   const loadingSlot = loadingBlock('Loading requests…');
 
+  let loadSeq = 0; // latest read wins: a slower earlier list read is discarded
   async function load() {
+    const mySeq = ++loadSeq;
     let incoming = [];
     let outgoing = [];
     try {
@@ -694,9 +692,11 @@ async function renderRequests(main) {
         apiFetch('/requests?direction=incoming', { accept: 'application/json' }),
         apiFetch('/requests?direction=outgoing', { accept: 'application/json' }),
       ]);
+      if (mySeq !== loadSeq) return;
       incoming = inc.requests || [];
       outgoing = out.requests || [];
     } catch (e) {
+      if (mySeq !== loadSeq) return;
       loadingSlot.remove();
       msg.show('error', 'Requests could not be loaded. ' + (e.message || ''), 'request-error');
       return;
@@ -842,12 +842,16 @@ async function renderAuthorizations(main) {
   const emptySlot = h('div', {});
   const loadingSlot = loadingBlock('Loading authorizations…');
 
+  let loadSeq = 0; // latest read wins: a slower earlier list read is discarded
   async function load() {
+    const mySeq = ++loadSeq;
     let items = [];
     try {
       const result = await apiFetch('/authorizations', { accept: 'application/json' });
+      if (mySeq !== loadSeq) return;
       items = result.authorizations || [];
     } catch (e) {
+      if (mySeq !== loadSeq) return;
       loadingSlot.remove();
       msg.show('error', 'Authorizations could not be loaded. ' + (e.message || ''), 'authorization-error');
       return;
